@@ -1,0 +1,92 @@
+.vc-ce-modal {
+    width: 100%;
+    box-sizing: border-box;
+}
+
+[class*="modal"] [class*="scroller"],
+[class*="modal"] [class*="content"],
+[class*="modalContent"],
+.vc-ce-modal {
+    scrollbar-width: none !important;
+}
+
+[class*="modal"] [class*="scroller"]::-webkit-scrollbar,
+[class*="modal"] [class*="content"]::-webkit-scrollbar,
+[class*="modalContent"]::-webkit-scrollbar,
+.vc-ce-modal::-webkit-scrollbar {
+    display: none !important;
+    width: 0px !important;
+    height: 0px !important;
+    background: transparent !important;
+}
+
+.vc-ce-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 12px;
+}
+
+.vc-ce-section:last-child {
+    margin-bottom: 0;
+}
+
+.vc-ce-label {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--header-secondary, #b5bac1);
+}
+
+.vc-ce-input,
+.vc-ce-select {
+    width: 100% !important;
+    box-sizing: border-box !important;
+    padding: 10px 12px !important;
+    border-radius: 4px !important;
+    background-color: var(--input-background, #1e1f22) !important;
+    color: var(--text-normal, #f2f3f5) !important;
+    border: 1px solid var(--input-border, #3b3e45) !important;
+    font-size: 14px !important;
+    outline: none !important;
+    transition: border-color 0.2s ease !important;
+}
+
+.vc-ce-input:focus,
+.vc-ce-select:focus {
+    border-color: var(--brand-500, #5865f2) !important;
+}
+
+.vc-ce-row {
+    display: flex;
+    gap: 12px;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.vc-ce-col {
+    flex: 1;
+    min-width: 0;
+}
+
+.vc-ce-progress-box {
+    padding: 32px 16px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+}
+
+.vc-ce-progress-count {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--brand-500, #5865f2);
+}
+
+.vc-ce-progress-desc {
+    font-size: 14px;
+    color: var(--text-muted, #949ba4);
+}
