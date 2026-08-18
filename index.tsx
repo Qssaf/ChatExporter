@@ -13,7 +13,7 @@ import { HeadingSecondary } from "@components/Heading";
 import { Paragraph } from "@components/Paragraph";
 import definePlugin from "@utils/types";
 import { Channel, Message, RenderModalProps } from "@vencord/discord-types";
-import { AuthenticationStore, ChannelStore, Constants, Menu, Modal, openModal, RestAPI, Toasts, useState } from "@webpack/common";
+import { AuthenticationStore, ChannelStore, Constants, createRoot, Menu, Modal, openModal, RestAPI, Toasts, useEffect, useState } from "@webpack/common";
 
 const DISCORD_EPOCH = 1420070400000n;
 
@@ -89,6 +89,70 @@ function formatDuration(seconds: number): string {
     return `${mins}m ${secs}s`;
 }
 
+export interface ActiveExportTask {
+    id: string;
+    channelName: string;
+    controller: AbortController;
+    progress: ExportProgress;
+}
+
+const taskListeners = new Set<() => void>();
+export const activeExportTasks = new Map<string, ActiveExportTask>();
+
+function notifyTaskUpdate() {
+    taskListeners.forEach(fn => fn());
+}
+
+export function ActiveExportsDock() {
+    const [, forceUpdate] = useState({});
+
+    useEffect(() => {
+        const update = () => forceUpdate({});
+        taskListeners.add(update);
+        return () => { taskListeners.delete(update); };
+    }, []);
+
+    if (activeExportTasks.size === 0) return null;
+
+    return (
+        <div className="vc-ce-manager-dock">
+            {Array.from(activeExportTasks.values()).map(task => (
+                <div key={task.id} className="vc-ce-task-card">
+                    <div className="vc-ce-task-header">
+                        <div className="vc-ce-task-title">
+                            📥 #{task.channelName}
+                        </div>
+                        <button
+                            className="vc-ce-cancel-btn"
+                            title="Cancel Export"
+                            onClick={() => {
+                                task.controller.abort();
+                                activeExportTasks.delete(task.id);
+                                notifyTaskUpdate();
+                                showToast(`Export for #${task.channelName} canceled.`, Toasts.Type.MESSAGE);
+                            }}
+                        >
+                            ✕ Cancel
+                        </button>
+                    </div>
+
+                    <div className="vc-ce-task-bar-bg">
+                        <div
+                            className="vc-ce-task-bar-fill"
+                            style={{ width: `${Math.min(100, Math.max(0, task.progress.percentage))}%` }}
+                        />
+                    </div>
+
+                    <div className="vc-ce-task-meta">
+                        <span><b>{task.progress.count.toLocaleString()}</b> msgs ({task.progress.rate}/s)</span>
+                        <span>{task.progress.percentage}% • {task.progress.etaText}</span>
+                    </div>
+                </div>
+            ))}
+        </div>
+    );
+}
+
 const GROUPING_TIME_THRESHOLD_MS = 7 * 60 * 1000;
 
 interface MessageGroup {
@@ -144,7 +208,7 @@ function groupMessages(messages: any[]): MessageGroup[] {
     return groups;
 }
 
-async function fetchBatch(channelId: string, query: Record<string, any>) {
+async function fetchBatch(channelId: string, query: Record<string, any>, signal?: AbortSignal) {
     const token = AuthenticationStore?.getToken?.();
     const queryString = new URLSearchParams(query).toString();
     const url = `https://discord.com/api/v10/channels/${channelId}/messages?${queryString}`;
@@ -157,7 +221,8 @@ async function fetchBatch(channelId: string, query: Record<string, any>) {
             },
             cache: "no-store",
             keepalive: true,
-            priority: "high"
+            priority: "high",
+            signal
         } as any);
 
         if (response.status === 429) {
@@ -193,8 +258,8 @@ async function fetchBatch(channelId: string, query: Record<string, any>) {
 async function fetchMessagesFast(
     channelId: string,
     options: ExportOptions,
-    onProgress: (progress: ExportProgress) => void,
-    shouldCancel: () => boolean
+    abortSignal: AbortSignal,
+    onProgress: (progress: ExportProgress) => void
 ): Promise<Message[]> {
     const allMessages: any[] = [];
     const beforeSnowflake = options.beforeDate ? dateToSnowflake(new Date(options.beforeDate)) : undefined;
@@ -203,13 +268,17 @@ async function fetchMessagesFast(
     const isReverse = Boolean(options.reverseOrder);
     const respectRateLimits = options.respectRateLimits !== false;
 
+    if (abortSignal.aborted) throw { isCanceled: true };
+
     let omegaTimestamp: number | null = null;
     try {
-        const omegaRes = await fetchBatch(channelId, { limit: 1, ...(beforeSnowflake ? { before: beforeSnowflake } : {}) });
+        const omegaRes = await fetchBatch(channelId, { limit: 1, ...(beforeSnowflake ? { before: beforeSnowflake } : {}) }, abortSignal);
         if (omegaRes?.body?.[0]?.timestamp) {
             omegaTimestamp = new Date(omegaRes.body[0].timestamp).getTime();
         }
-    } catch {}
+    } catch (e: any) {
+        if (abortSignal.aborted || e?.name === "AbortError") throw { isCanceled: true };
+    }
 
     let alphaTimestamp: number | null = null;
     let currentBoundary = !isReverse ? (afterSnowflake ?? "0") : beforeSnowflake;
@@ -226,13 +295,15 @@ async function fetchMessagesFast(
         return query;
     };
 
-    let pendingFetch: Promise<any> | null = fetchBatch(channelId, buildQuery(currentBoundary, maxCount - allMessages.length));
+    let pendingFetch: Promise<any> | null = fetchBatch(channelId, buildQuery(currentBoundary, maxCount - allMessages.length), abortSignal);
 
     while (allMessages.length < maxCount) {
-        if (shouldCancel() || !pendingFetch) break;
+        if (abortSignal.aborted || !pendingFetch) throw { isCanceled: true };
 
         try {
             const res = await pendingFetch;
+            if (abortSignal.aborted) throw { isCanceled: true };
+
             let messages: any[] = res?.body ?? [];
             if (!messages || messages.length === 0) break;
 
@@ -250,8 +321,8 @@ async function fetchMessagesFast(
             const countAfterThis = allMessages.length + messages.length;
             const hasMore = messages.length === 100 && countAfterThis < maxCount;
 
-            if (hasMore && !shouldCancel()) {
-                pendingFetch = fetchBatch(channelId, buildQuery(nextBoundary, maxCount - countAfterThis));
+            if (hasMore && !abortSignal.aborted) {
+                pendingFetch = fetchBatch(channelId, buildQuery(nextBoundary, maxCount - countAfterThis), abortSignal);
             } else {
                 pendingFetch = null;
             }
@@ -315,11 +386,13 @@ async function fetchMessagesFast(
                 }
             }
         } catch (err: any) {
-            console.error("[ChatExporter] API Error:", err);
+            if (abortSignal.aborted || err?.isCanceled || err?.name === "AbortError") {
+                throw { isCanceled: true };
+            }
             if (err?.status === 429) {
                 const retryAfter = (err?.body?.retry_after ?? 1.2) * 1000;
                 await new Promise(r => setTimeout(r, retryAfter + 50));
-                pendingFetch = fetchBatch(channelId, buildQuery(currentBoundary, maxCount - allMessages.length));
+                pendingFetch = fetchBatch(channelId, buildQuery(currentBoundary, maxCount - allMessages.length), abortSignal);
                 continue;
             }
             throw err;
@@ -541,14 +614,24 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
         percentage: 0,
         etaText: "Estimating...",
     });
-    const [canceled, setCanceled] = useState<boolean>(false);
 
     const channelName = getChannelDisplayName(channel);
 
     const handleStartExport = async () => {
+        const taskId = `${channel.id}-${Date.now()}`;
+        const controller = new AbortController();
+        const initialProgress: ExportProgress = { count: 0, rate: 0, percentage: 0, etaText: "Estimating..." };
+
+        activeExportTasks.set(taskId, {
+            id: taskId,
+            channelName,
+            controller,
+            progress: initialProgress
+        });
+        notifyTaskUpdate();
+
         setIsExporting(true);
-        setCanceled(false);
-        setProgress({ count: 0, rate: 0, percentage: 0, etaText: "Estimating..." });
+        setProgress(initialProgress);
 
         try {
             const messages = await fetchMessagesFast(
@@ -561,13 +644,24 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                     includeBotMessages: includeBots,
                     respectRateLimits: !hyperSpeed,
                 },
-                p => setProgress(p),
-                () => canceled
+                controller.signal,
+                p => {
+                    setProgress(p);
+                    const task = activeExportTasks.get(taskId);
+                    if (task) {
+                        task.progress = p;
+                        notifyTaskUpdate();
+                    }
+                }
             );
+
+            if (controller.signal.aborted) {
+                showToast(`Export for #${channelName} canceled.`, Toasts.Type.MESSAGE);
+                return;
+            }
 
             if (messages.length === 0) {
                 showToast("No messages found matching your criteria.", Toasts.Type.WARNING);
-                setIsExporting(false);
                 return;
             }
 
@@ -596,12 +690,18 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                     break;
             }
 
-            showToast(`Exported ${messages.length} messages successfully!`, Toasts.Type.SUCCESS);
+            showToast(`Exported ${messages.length.toLocaleString()} messages successfully!`, Toasts.Type.SUCCESS);
             modalProps.onClose();
         } catch (err: any) {
-            console.error("[ChatExporter] Export failed:", err);
-            showToast(`Export failed: ${err.message || "Unknown error"}`, Toasts.Type.FAILURE);
+            if (controller.signal.aborted || err?.isCanceled) {
+                showToast(`Export for #${channelName} canceled.`, Toasts.Type.MESSAGE);
+            } else {
+                console.error("[ChatExporter] Export failed:", err);
+                showToast(`Export failed: ${err.message || "Unknown error"}`, Toasts.Type.FAILURE);
+            }
         } finally {
+            activeExportTasks.delete(taskId);
+            notifyTaskUpdate();
             setIsExporting(false);
         }
     };
@@ -617,7 +717,8 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                     text: "Cancel Export",
                     variant: "dangerPrimary",
                     onClick: () => {
-                        setCanceled(true);
+                        const task = Array.from(activeExportTasks.values()).find(t => t.channelName === channelName);
+                        task?.controller.abort();
                         setIsExporting(false);
                     }
                 }
@@ -764,6 +865,9 @@ const contextMenuPatch: NavContextMenuPatchCallback = (children, { channel, user
     );
 };
 
+let dockContainer: HTMLDivElement | null = null;
+let dockRoot: any = null;
+
 export default definePlugin({
     name: "ChatExporter",
     description: "High-speed chat exporter based on DiscordChatExporter with date filtering, limits, and multi-format exports.",
@@ -780,5 +884,27 @@ export default definePlugin({
         "user-context": contextMenuPatch,
         "gdm-context": contextMenuPatch,
     },
-});
 
+    start() {
+        if (!dockContainer && typeof document !== "undefined") {
+            dockContainer = document.createElement("div");
+            dockContainer.id = "vc-ce-dock-container";
+            document.body.appendChild(dockContainer);
+            if (createRoot) {
+                dockRoot = createRoot(dockContainer);
+                dockRoot.render(<ActiveExportsDock />);
+            }
+        }
+    },
+
+    stop() {
+        if (dockRoot) {
+            dockRoot.unmount();
+            dockRoot = null;
+        }
+        if (dockContainer) {
+            dockContainer.remove();
+            dockContainer = null;
+        }
+    }
+});
