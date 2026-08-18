@@ -64,6 +64,13 @@ function downloadFile(content: string, filename: string, mimeType: string) {
 
 export type ExportFormat = "HtmlDark" | "HtmlLight" | "Json" | "Csv" | "PlainText";
 
+export interface ExportProgress {
+    count: number;
+    rate: number;
+    percentage: number;
+    etaText: string;
+}
+
 interface ExportOptions {
     format: ExportFormat;
     afterDate?: string;
@@ -72,6 +79,14 @@ interface ExportOptions {
     includeBotMessages: boolean;
     reverseOrder?: boolean;
     respectRateLimits?: boolean;
+}
+
+function formatDuration(seconds: number): string {
+    if (seconds < 0 || !isFinite(seconds)) return "Estimating...";
+    if (seconds < 60) return `${Math.round(seconds)}s`;
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.round(seconds % 60);
+    return `${mins}m ${secs}s`;
 }
 
 const GROUPING_TIME_THRESHOLD_MS = 7 * 60 * 1000;
@@ -178,7 +193,7 @@ async function fetchBatch(channelId: string, query: Record<string, any>) {
 async function fetchMessagesFast(
     channelId: string,
     options: ExportOptions,
-    onProgress: (count: number, rate: number) => void,
+    onProgress: (progress: ExportProgress) => void,
     shouldCancel: () => boolean
 ): Promise<Message[]> {
     const allMessages: any[] = [];
@@ -188,6 +203,15 @@ async function fetchMessagesFast(
     const isReverse = Boolean(options.reverseOrder);
     const respectRateLimits = options.respectRateLimits !== false;
 
+    let omegaTimestamp: number | null = null;
+    try {
+        const omegaRes = await fetchBatch(channelId, { limit: 1, ...(beforeSnowflake ? { before: beforeSnowflake } : {}) });
+        if (omegaRes?.body?.[0]?.timestamp) {
+            omegaTimestamp = new Date(omegaRes.body[0].timestamp).getTime();
+        }
+    } catch {}
+
+    let alphaTimestamp: number | null = null;
     let currentBoundary = !isReverse ? (afterSnowflake ?? "0") : beforeSnowflake;
     const startTime = Date.now();
     let lastProgressUpdate = 0;
@@ -218,6 +242,10 @@ async function fetchMessagesFast(
                 messages.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : -1));
             }
 
+            if (alphaTimestamp === null && messages.length > 0) {
+                alphaTimestamp = new Date(messages[0].timestamp).getTime();
+            }
+
             const nextBoundary = messages[messages.length - 1].id;
             const countAfterThis = allMessages.length + messages.length;
             const hasMore = messages.length === 100 && countAfterThis < maxCount;
@@ -245,7 +273,33 @@ async function fetchMessagesFast(
             if (now - lastProgressUpdate > 100 || allMessages.length >= maxCount) {
                 const elapsedSec = Math.max(0.1, (now - startTime) / 1000);
                 const rate = Math.round(allMessages.length / elapsedSec);
-                onProgress(allMessages.length, rate);
+
+                let fraction = 0;
+                if (maxCount !== Infinity && maxCount > 0) {
+                    fraction = Math.min(1, allMessages.length / maxCount);
+                } else if (alphaTimestamp !== null && omegaTimestamp !== null && omegaTimestamp > alphaTimestamp) {
+                    const currentMsgTimestamp = new Date(messages[messages.length - 1].timestamp).getTime();
+                    const totalSpan = Math.abs(omegaTimestamp - alphaTimestamp);
+                    const currentSpan = Math.abs(currentMsgTimestamp - alphaTimestamp);
+                    fraction = Math.min(1, Math.max(0, currentSpan / totalSpan));
+                }
+
+                const percent = Math.round(fraction * 100);
+                let etaText = "Estimating...";
+                if (fraction > 0.02 && fraction < 1) {
+                    const totalEstimatedSec = elapsedSec / fraction;
+                    const remainingSec = Math.max(0, totalEstimatedSec - elapsedSec);
+                    etaText = `~${formatDuration(remainingSec)}`;
+                } else if (fraction >= 1) {
+                    etaText = "Finishing...";
+                }
+
+                onProgress({
+                    count: allMessages.length,
+                    rate,
+                    percentage: percent,
+                    etaText
+                });
                 lastProgressUpdate = now;
             }
 
@@ -481,8 +535,12 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
     const [hyperSpeed, setHyperSpeed] = useState<boolean>(true);
 
     const [isExporting, setIsExporting] = useState<boolean>(false);
-    const [progressCount, setProgressCount] = useState<number>(0);
-    const [fetchRate, setFetchRate] = useState<number>(0);
+    const [progress, setProgress] = useState<ExportProgress>({
+        count: 0,
+        rate: 0,
+        percentage: 0,
+        etaText: "Estimating...",
+    });
     const [canceled, setCanceled] = useState<boolean>(false);
 
     const channelName = getChannelDisplayName(channel);
@@ -490,7 +548,7 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
     const handleStartExport = async () => {
         setIsExporting(true);
         setCanceled(false);
-        setProgressCount(0);
+        setProgress({ count: 0, rate: 0, percentage: 0, etaText: "Estimating..." });
 
         try {
             const messages = await fetchMessagesFast(
@@ -503,10 +561,7 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                     includeBotMessages: includeBots,
                     respectRateLimits: !hyperSpeed,
                 },
-                (count, rate) => {
-                    setProgressCount(count);
-                    setFetchRate(rate);
-                },
+                p => setProgress(p),
                 () => canceled
             );
 
@@ -581,12 +636,37 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
         >
             {isExporting ? (
                 <div className="vc-ce-progress-box">
-                    <HeadingSecondary>Fetching Messages...</HeadingSecondary>
+                    <HeadingSecondary>Exporting Messages...</HeadingSecondary>
                     <div className="vc-ce-progress-count">
-                        {progressCount} messages ({fetchRate} msgs/sec)
+                        {progress.count.toLocaleString()} messages ({progress.rate} msgs/sec)
                     </div>
-                    <div className="vc-ce-progress-desc">
-                        Streaming requests over HTTP/2 at maximum socket speed.
+
+                    <div style={{
+                        width: "100%",
+                        height: "10px",
+                        backgroundColor: "var(--background-secondary-alt, #1e1f22)",
+                        borderRadius: "5px",
+                        overflow: "hidden",
+                        margin: "6px 0",
+                        border: "1px solid var(--input-border, #3b3e45)"
+                    }}>
+                        <div style={{
+                            width: `${Math.min(100, Math.max(0, progress.percentage))}%`,
+                            height: "100%",
+                            backgroundColor: "var(--brand-500, #5865f2)",
+                            transition: "width 0.2s ease"
+                        }} />
+                    </div>
+
+                    <div style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        width: "100%",
+                        fontSize: "13px",
+                        color: "var(--text-muted, #949ba4)"
+                    }}>
+                        <span>Progress: <b>{progress.percentage}%</b></span>
+                        <span>Estimated Time: <b>{progress.etaText}</b></span>
                     </div>
                 </div>
             ) : (
