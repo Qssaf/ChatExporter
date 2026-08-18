@@ -1,4 +1,4 @@
-# 📥 ChatExporter
+# ChatExporter
 
 A high-performance Discord chat export plugin for **Vencord** and **Vesktop**, inspired by [DiscordChatExporter](https://github.com/Tyrrrz/DiscordChatExporter).
 
@@ -6,24 +6,24 @@ Export complete message histories from **Direct Messages (DMs)**, **Group DMs**,
 
 ---
 
-## ✨ Features
+## Features
 
-* **⚡ Ultra-Fast Throughput:** Uses Discord API v10 with native HTTP/2 streaming, interleaved asynchronous pipelining, and 64-bit Discord Snowflake date indexing for maximum download speeds.
-* **📦 Multiple Export Formats:**
+* **Ultra-Fast Throughput:** Uses Discord API v10 with native HTTP/2 streaming, interleaved asynchronous pipelining, and 64-bit Discord Snowflake date indexing for maximum download speeds.
+* **Multiple Export Formats:**
   * **HTML (Dark Theme):** Styled to look and feel like Discord with avatars, embeds, attachments, and timestamps.
   * **HTML (Light Theme):** Discord light mode styling.
   * **JSON:** Full structured message objects with all metadata.
   * **CSV:** Spreadsheet-compatible format with timestamps, authors, reactions, and attachments.
   * **Plain Text (.txt):** Clean, chronological text transcripts.
-* **💬 Discord-Style Message Grouping:** Consecutive messages sent by the same user within 7 minutes are grouped together with a single avatar/header.
-* **🎯 Rich Message Elements:** Renders markdown (bold, italics, code blocks), replied-to message previews, reactions with count badges, custom emojis, stickers, and image previews.
-* **⏱ Advanced Filtering:** Filter by date range (**After** / **Before**) and set custom message limits.
-* **🚀 Hyper-Speed Mode:** Aggressive mode that bypasses sliding advisory rate-limit pauses, operating at maximum connection bandwidth and pausing only on HTTP 429 responses.
-* **🛡️ Client-Native:** Runs directly in your client without needing third-party token scrapers or external binaries.
+* **Discord-Style Message Grouping:** Consecutive messages sent by the same user within 7 minutes are grouped together with a single avatar/header.
+* **Rich Message Elements:** Renders markdown (bold, italics, code blocks), replied-to message previews, reactions with count badges, custom emojis, stickers, and image previews.
+* **Advanced Filtering:** Filter by date range (**After** / **Before**) and set custom message limits.
+* **Hyper-Speed Mode:** Aggressive mode that bypasses sliding advisory rate-limit pauses, operating at maximum connection bandwidth and pausing only on HTTP 429 responses.
+* **Client-Native:** Runs directly in your client without needing third-party token scrapers or external binaries.
 
 ---
 
-## 🛠️ Installation
+## Installation
 
 ### Method 1: Installing in Vesktop
 
@@ -84,10 +84,10 @@ Export complete message histories from **Direct Messages (DMs)**, **Group DMs**,
 
 ---
 
-## 📖 How to Use
+## How to Use
 
 1. Open Discord / Vesktop.
-2. Ensure the plugin is enabled in **User Settings → Plugins → Search "ChatExporter"** (it is enabled by default).
+2. Ensure the plugin is enabled in **User Settings -> Plugins -> Search "ChatExporter"** (it is enabled by default).
 3. **Right-click** any DM, Group Chat, or Server Channel in your sidebar.
 4. Click **Export Chat**.
 5. Select your desired format, date filters, or limits in the dialog and click **Export**.
@@ -95,7 +95,7 @@ Export complete message histories from **Direct Messages (DMs)**, **Group DMs**,
 
 ---
 
-## ⚙️ Export Options
+## Export Options
 
 | Option | Description |
 |---|---|
@@ -108,6 +108,6 @@ Export complete message histories from **Direct Messages (DMs)**, **Group DMs**,
 
 ---
 
-## 📄 License
+## License
 
 Licensed under the [GNU General Public License v3.0 (GPL-3.0)](LICENSE).
