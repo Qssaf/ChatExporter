@@ -432,82 +432,126 @@ function formatMarkdown(text: string): string {
 
 function formatHtml(channelName: string, channelId: string, messages: any[], theme: "dark" | "light"): string {
     const isDark = theme === "dark";
-    const bg = isDark ? "#313338" : "#ffffff";
-    const fg = isDark ? "#dbdee1" : "#313338";
-    const headerBg = isDark ? "#2b2d31" : "#f2f3f5";
-    const authorColor = isDark ? "#f2f3f5" : "#060607";
-    const hoverBg = isDark ? "#2e3035" : "#f8f9fa";
-    const border = isDark ? "#1e1f22" : "#e3e5e8";
-    const subText = isDark ? "#949ba4" : "#5c5e66";
-    const embedBg = isDark ? "#2b2d31" : "#f2f3f5";
+    const bg = isDark ? "#36393e" : "#ffffff";
+    const fg = isDark ? "#dcddde" : "#23262a";
+    const authorColor = isDark ? "#ffffff" : "#2f3136";
+    const linkColor = isDark ? "#00aff4" : "#0068e0";
+    const subText = isDark ? "#a3a6aa" : "#5e6772";
+    const borderCol = isDark ? "rgba(255, 255, 255, 0.1)" : "#eceeef";
+    const hoverBg = isDark ? "#32353b" : "#fafafa";
+    const embedBg = isDark ? "rgba(46, 48, 54, 0.3)" : "rgba(249, 249, 249, 0.3)";
+    const embedBorder = isDark ? "rgba(46, 48, 54, 0.6)" : "rgba(204, 204, 204, 0.3)";
+    const preBg = isDark ? "#2f3136" : "#f9f9f9";
+    const reactionBg = isDark ? "#2f3136" : "#f2f3f5";
 
     const groups = groupMessages(messages);
 
     const groupsHtml = groups.map(group => {
-        const timestampStr = group.firstTimestamp.toLocaleString();
-        const botBadge = group.author.isBot
-            ? `<span style="background: #5865f2; color: #ffffff; font-size: 10px; font-weight: 700; padding: 1px 4px; border-radius: 3px; margin-left: 4px; text-transform: uppercase;">BOT</span>`
-            : "";
-
-        const firstMsg = group.messages[0];
-        let replyHeaderHtml = "";
-        if (firstMsg?.referenced_message) {
-            const ref = firstMsg.referenced_message;
-            const refAuthor = ref.author?.global_name || ref.author?.username || "Unknown";
-            const refAvatar = ref.author?.avatar
-                ? `https://cdn.discordapp.com/avatars/${ref.author.id}/${ref.author.avatar}.png?size=32`
-                : "https://cdn.discordapp.com/embed/avatars/0.png";
-            const refContent = sanitizeHtml((ref.content || "").slice(0, 120)) || "Click to see attachment";
-
-            replyHeaderHtml = `
-            <div class="chatlog__reply" style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px; margin-left: 56px; font-size: 13px; color: ${subText}; position: relative;">
-                <div style="position: absolute; left: -36px; top: 8px; width: 30px; height: 12px; border-left: 2px solid ${subText}; border-top: 2px solid ${subText}; border-top-left-radius: 6px; opacity: 0.5;"></div>
-                <img src="${refAvatar}" style="width: 16px; height: 16px; border-radius: 50%;" />
-                <span style="font-weight: 600; color: ${authorColor};">${sanitizeHtml(refAuthor)}</span>
-                <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 480px; opacity: 0.8;">${refContent}</span>
-            </div>`;
-        }
-
-        const messagesHtml = group.messages.map((msg, idx) => {
+        const messagesHtml = group.messages.map((msg, i) => {
+            const isFirst = i === 0;
+            const msgDate = new Date(msg.timestamp);
+            const fullTimestamp = msgDate.toLocaleString();
+            const shortTimestamp = msgDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            const author = msg.author?.global_name || msg.author?.username || "Unknown";
+            const username = msg.author?.username || "unknown";
+            const isBot = Boolean(msg.author?.bot);
             const content = formatMarkdown(msg.content);
-            const msgTime = new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            const isReply = Boolean(msg.referenced_message);
+
             const editedHtml = msg.edited_timestamp
-                ? `<span style="font-size: 10px; color: ${subText}; margin-left: 4px; opacity: 0.7;">(edited)</span>`
+                ? `<span class="chatlog__edited-timestamp" title="${new Date(msg.edited_timestamp).toLocaleString()}">(edited)</span>`
                 : "";
 
-            let inlineReply = "";
-            if (idx > 0 && msg.referenced_message) {
+            let asideHtml = "";
+            if (isFirst) {
+                const replySymbol = isReply ? `<div class="chatlog__reply-symbol"></div>` : "";
+                asideHtml = `
+                <div class="chatlog__message-aside">
+                    ${replySymbol}
+                    <img class="chatlog__avatar" src="${group.author.avatarUrl}" alt="${sanitizeHtml(username)}" loading="lazy" />
+                </div>`;
+            } else {
+                asideHtml = `
+                <div class="chatlog__message-aside">
+                    <div class="chatlog__short-timestamp" title="${fullTimestamp}">${shortTimestamp}</div>
+                </div>`;
+            }
+
+            let replyHtml = "";
+            if (isReply) {
                 const ref = msg.referenced_message;
                 const refAuthor = ref.author?.global_name || ref.author?.username || "Unknown";
                 const refAvatar = ref.author?.avatar
                     ? `https://cdn.discordapp.com/avatars/${ref.author.id}/${ref.author.avatar}.png?size=32`
                     : "https://cdn.discordapp.com/embed/avatars/0.png";
-                const refContent = sanitizeHtml((ref.content || "").slice(0, 100)) || "Click to see attachment";
-                inlineReply = `
-                <div class="chatlog__reply" style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-size: 12px; color: ${subText};">
-                    <span style="opacity: 0.5;">┌</span>
-                    <img src="${refAvatar}" style="width: 14px; height: 14px; border-radius: 50%;" />
-                    <span style="font-weight: 600; color: ${authorColor};">${sanitizeHtml(refAuthor)}</span>
-                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 400px; opacity: 0.8;">${refContent}</span>
+                const refContent = sanitizeHtml((ref.content || "").slice(0, 140)) || "Click to see attachment";
+
+                replyHtml = `
+                <div class="chatlog__reply">
+                    <img class="chatlog__reply-avatar" src="${refAvatar}" alt="Avatar" loading="lazy" />
+                    <div class="chatlog__reply-author">${sanitizeHtml(refAuthor)}</div>
+                    <div class="chatlog__reply-content">
+                        <span class="chatlog__reply-link" onclick="scrollToMessage(event, '${ref.id}')">${refContent}</span>
+                    </div>
+                </div>`;
+            }
+
+            let headerHtml = "";
+            if (isFirst) {
+                const botTag = isBot ? `<span class="chatlog__author-tag">BOT</span>` : "";
+                headerHtml = `
+                <div class="chatlog__header">
+                    <span class="chatlog__author" title="${sanitizeHtml(username)}" data-user-id="${group.author.id}">${sanitizeHtml(author)}</span>
+                    ${botTag}
+                    <span class="chatlog__timestamp" title="${fullTimestamp}"><a href="#chatlog__message-container-${msg.id}">${fullTimestamp}</a></span>
                 </div>`;
             }
 
             let attachmentsHtml = "";
             if (msg.attachments?.length) {
-                attachmentsHtml = msg.attachments.map((a: any) => {
-                    const isImg = a.content_type?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(a.filename);
+                attachmentsHtml = msg.attachments.map((att: any) => {
+                    const isImg = att.content_type?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(att.filename);
+                    const isVid = att.content_type?.startsWith("video/") || /\.(mp4|webm|mov)$/i.test(att.filename);
+                    const isAudio = att.content_type?.startsWith("audio/") || /\.(mp3|ogg|wav)$/i.test(att.filename);
+
                     if (isImg) {
-                        return `<div style="margin-top: 6px;"><a href="${a.url}" target="_blank"><img src="${a.url}" loading="lazy" style="max-width: 450px; max-height: 350px; border-radius: 8px;"/></a></div>`;
+                        return `
+                        <div class="chatlog__attachment">
+                            <a href="${att.url}" target="_blank">
+                                <img class="chatlog__attachment-media" src="${att.url}" alt="${sanitizeHtml(att.filename)}" loading="lazy" />
+                            </a>
+                        </div>`;
                     }
-                    return `<div style="margin-top: 4px;"><a href="${a.url}" target="_blank" style="color: #00a8fc; text-decoration: none; font-size: 14px;">📎 ${sanitizeHtml(a.filename)}</a></div>`;
+                    if (isVid) {
+                        return `
+                        <div class="chatlog__attachment">
+                            <video class="chatlog__attachment-media" controls>
+                                <source src="${att.url}" type="${att.content_type || 'video/mp4'}" />
+                            </video>
+                        </div>`;
+                    }
+                    if (isAudio) {
+                        return `
+                        <div class="chatlog__attachment">
+                            <audio class="chatlog__attachment-media" controls>
+                                <source src="${att.url}" type="${att.content_type || 'audio/ogg'}" />
+                            </audio>
+                        </div>`;
+                    }
+                    return `
+                    <div class="chatlog__attachment-generic">
+                        <div class="chatlog__attachment-generic-name"><a href="${att.url}" target="_blank">${sanitizeHtml(att.filename)}</a></div>
+                        <div class="chatlog__attachment-generic-size">${att.size ? (att.size / 1024).toFixed(1) + ' KB' : ''}</div>
+                    </div>`;
                 }).join("");
             }
 
             let stickersHtml = "";
             if (msg.sticker_items?.length) {
-                stickersHtml = msg.sticker_items.map((st: any) => {
-                    return `<div style="margin-top: 6px;"><img src="https://media.discordapp.net/stickers/${st.id}.png?size=160" alt="${sanitizeHtml(st.name)}" style="width: 160px; height: 160px; object-fit: contain;" /></div>`;
-                }).join("");
+                stickersHtml = msg.sticker_items.map((st: any) => `
+                <div class="chatlog__sticker" title="${sanitizeHtml(st.name)}">
+                    <img class="chatlog__sticker--media" src="https://media.discordapp.net/stickers/${st.id}.png?size=160" alt="Sticker" />
+                </div>`).join("");
             }
 
             let embedsHtml = "";
@@ -515,108 +559,441 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
                 embedsHtml = msg.embeds.map((em: any) => {
                     if (em.video?.url) {
                         return `
-                        <div class="chatlog__embed" style="margin-top: 6px; max-width: 450px;">
-                            <video src="${em.video.url}" controls autoplay loop muted playsinline style="max-width: 100%; border-radius: 8px;"></video>
+                        <div class="chatlog__embed">
+                            <video class="chatlog__embed-generic-gifv" width="${em.video.width || 400}" height="${em.video.height || 300}" autoplay loop muted playsinline controls>
+                                <source src="${em.video.url}" />
+                            </video>
                         </div>`;
                     }
 
                     const imgUrl = em.image?.url || em.thumbnail?.url;
                     if (em.type === "image" || em.type === "gifv" || (imgUrl && !em.title && !em.description)) {
                         return `
-                        <div class="chatlog__embed" style="margin-top: 6px; max-width: 450px;">
+                        <div class="chatlog__embed">
                             <a href="${imgUrl || em.url}" target="_blank">
-                                <img src="${imgUrl || em.url}" loading="lazy" style="max-width: 100%; max-height: 350px; border-radius: 8px;" />
+                                <img class="chatlog__embed-generic-image" src="${imgUrl || em.url}" loading="lazy" alt="Embedded image" />
                             </a>
                         </div>`;
                     }
 
-                    const title = em.title ? `<h4 style="margin: 0 0 4px 0; color: ${authorColor}; font-size: 14px;"><a href="${em.url || '#'}" target="_blank" style="color: inherit; text-decoration: none;">${sanitizeHtml(em.title)}</a></h4>` : "";
-                    const desc = em.description ? `<p style="margin: 0; font-size: 13px; line-height: 1.3;">${formatMarkdown(em.description)}</p>` : "";
-                    const color = em.color ? (em.color).toString(16).padStart(6, "0") : "5865f2";
-                    const embedImg = em.image?.url ? `<div style="margin-top: 8px;"><img src="${em.image.url}" loading="lazy" style="max-width: 100%; border-radius: 4px;" /></div>` : "";
-                    const embedThumb = em.thumbnail?.url && !em.image?.url ? `<img src="${em.thumbnail.url}" loading="lazy" style="width: 60px; height: 60px; border-radius: 4px; object-fit: cover; margin-left: 12px;" />` : "";
+                    const title = em.title ? `<div class="chatlog__embed-title"><a href="${em.url || '#'}" target="_blank">${sanitizeHtml(em.title)}</a></div>` : "";
+                    const desc = em.description ? `<div class="chatlog__embed-description">${formatMarkdown(em.description)}</div>` : "";
+                    const color = em.color ? (em.color).toString(16).padStart(6, "0") : "202225";
+                    const embedImg = em.image?.url ? `<div class="chatlog__embed-images chatlog__embed-images--single"><img class="chatlog__embed-image" src="${em.image.url}" loading="lazy" /></div>` : "";
+                    const embedThumb = em.thumbnail?.url && !em.image?.url ? `<img class="chatlog__embed-thumbnail" src="${em.thumbnail.url}" loading="lazy" />` : "";
 
                     return `
-                    <div class="chatlog__embed" style="display: flex; border-left: 4px solid #${color}; padding: 8px 12px; margin-top: 6px; background: ${embedBg}; border-radius: 4px; max-width: 520px; justify-content: space-between;">
-                        <div>
-                            ${title}
-                            ${desc}
-                            ${embedImg}
+                    <div class="chatlog__embed">
+                        <div class="chatlog__embed-color-pill" style="background-color: #${color};"></div>
+                        <div class="chatlog__embed-content-container">
+                            <div class="chatlog__embed-content">
+                                <div class="chatlog__embed-text">
+                                    ${title}
+                                    ${desc}
+                                    ${embedImg}
+                                </div>
+                                ${embedThumb}
+                            </div>
                         </div>
-                        ${embedThumb}
                     </div>`;
                 }).join("");
             }
 
             let reactionsHtml = "";
             if (msg.reactions?.length) {
-                reactionsHtml = `<div class="chatlog__reactions" style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px;">` +
+                reactionsHtml = `
+                <div class="chatlog__reactions">` +
                     msg.reactions.map((r: any) => {
                         const emojiUrl = r.emoji?.id ? `https://cdn.discordapp.com/emojis/${r.emoji.id}.png?size=32` : null;
                         const emojiElem = emojiUrl
-                            ? `<img src="${emojiUrl}" style="width: 16px; height: 16px; margin-right: 4px;" />`
-                            : `<span style="margin-right: 4px;">${r.emoji?.name || "👍"}</span>`;
-                        return `<div style="display: inline-flex; align-items: center; background: ${headerBg}; border: 1px solid ${border}; border-radius: 8px; padding: 2px 6px; font-size: 12px; color: ${subText};">${emojiElem}<span>${r.count}</span></div>`;
+                            ? `<img class="chatlog__emoji chatlog__emoji--small" src="${emojiUrl}" alt="${sanitizeHtml(r.emoji.name)}" />`
+                            : `<span>${r.emoji?.name || "👍"}</span>`;
+                        return `
+                        <div class="chatlog__reaction">
+                            ${emojiElem}
+                            <span class="chatlog__reaction-count">${r.count}</span>
+                        </div>`;
                     }).join("") +
                 `</div>`;
             }
 
             return `
-            <div class="chatlog__message" style="position: relative; margin-top: ${idx === 0 ? "0" : "4px"};">
-                ${inlineReply}
-                <span class="chatlog__short-timestamp" style="display: none; position: absolute; left: -56px; font-size: 11px; color: ${subText}; width: 44px; text-align: right;">${msgTime}</span>
-                <div class="chatlog__content" style="font-size: 15px; line-height: 1.375rem; word-break: break-word;">${content}${editedHtml}</div>
-                ${attachmentsHtml}
-                ${stickersHtml}
-                ${embedsHtml}
-                ${reactionsHtml}
+            <div id="chatlog__message-container-${msg.id}" class="chatlog__message-container" data-message-id="${msg.id}">
+                <div class="chatlog__message">
+                    ${asideHtml}
+                    <div class="chatlog__message-primary">
+                        ${replyHtml}
+                        ${headerHtml}
+                        ${content ? `<div class="chatlog__content chatlog__markdown"><span class="chatlog__markdown-preserve">${content}</span>${editedHtml}</div>` : ""}
+                        ${attachmentsHtml}
+                        ${stickersHtml}
+                        ${embedsHtml}
+                        ${reactionsHtml}
+                    </div>
+                </div>
             </div>`;
         }).join("");
 
         return `
-        <div class="chatlog__message-group" style="margin-bottom: 16px; padding: 4px 8px; border-radius: 4px;">
-            ${replyHeaderHtml}
-            <div style="display: flex;">
-                <div class="chatlog__author-avatar-container" style="width: 40px; height: 40px; margin-right: 16px; flex-shrink: 0;">
-                    <img class="chatlog__author-avatar" src="${group.author.avatarUrl}" alt="${sanitizeHtml(group.author.username)}" style="width: 40px; height: 40px; border-radius: 50%; object-fit: cover;" />
-                </div>
-                <div class="chatlog__messages" style="flex-grow: 1; min-width: 0;">
-                    <div class="chatlog__header" style="display: flex; align-items: baseline; gap: 6px; margin-bottom: 4px;">
-                        <span class="chatlog__author-name" style="font-weight: 600; color: ${authorColor}; font-size: 15px;">${sanitizeHtml(group.author.name)}</span>
-                        ${botBadge}
-                        <span class="chatlog__author-username" style="font-size: 12px; color: ${subText};">@${sanitizeHtml(group.author.username)}</span>
-                        <span class="chatlog__timestamp" style="font-size: 12px; color: ${subText}; margin-left: 4px;">${timestampStr}</span>
-                    </div>
-                    ${messagesHtml}
-                </div>
-            </div>
+        <div class="chatlog__message-group">
+            ${messagesHtml}
         </div>`;
     }).join("\n");
 
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>${sanitizeHtml(channelName)}</title>
+    <title>Export - ${sanitizeHtml(channelName)}</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width">
     <style>
-        body { background-color: ${bg}; color: ${fg}; font-family: 'gg sans', 'Noto Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif; margin: 0; padding: 24px; }
-        .header { background: ${headerBg}; padding: 20px; border-radius: 8px; margin-bottom: 24px; border: 1px solid ${border}; }
-        .header h1 { margin: 0 0 8px 0; font-size: 22px; color: ${authorColor}; }
-        .header p { margin: 0; font-size: 14px; color: ${subText}; }
-        .chatlog__message-group:hover { background-color: ${hoverBg}; }
-        .chatlog__message-group:hover .chatlog__short-timestamp { display: inline-block !important; }
-        video { outline: none; }
-        img { image-rendering: auto; }
+        @@font-face {
+            src: url("https://cdn.jsdelivr.net/gh/Tyrrrz/DiscordFonts@master/ggsans-normal-400.woff2");
+            font-family: gg sans;
+            font-weight: 400;
+            font-style: normal;
+        }
+        @@font-face {
+            src: url("https://cdn.jsdelivr.net/gh/Tyrrrz/DiscordFonts@master/ggsans-normal-600.woff2");
+            font-family: gg sans;
+            font-weight: 600;
+            font-style: normal;
+        }
+        html, body {
+            margin: 0;
+            padding: 0;
+            background-color: ${bg};
+            color: ${fg};
+            font-family: "gg sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+            font-size: 17px;
+            font-weight: 400;
+            scroll-behavior: smooth;
+        }
+        a {
+            color: ${linkColor};
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        img {
+            object-fit: contain;
+            image-rendering: high-quality;
+        }
+        .preamble {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            max-width: 100%;
+            padding: 1.25rem;
+            border-bottom: 1px solid ${borderCol};
+        }
+        .preamble__entries-container {
+            grid-column: 2;
+            margin-left: 1rem;
+        }
+        .preamble__entry {
+            margin-bottom: 0.2rem;
+            color: ${authorColor};
+            font-size: 1.4rem;
+            font-weight: 600;
+        }
+        .preamble__entry--small {
+            font-size: 1rem;
+            font-weight: 400;
+            color: ${subText};
+        }
+        .chatlog {
+            padding: 1rem 0;
+            width: 100%;
+        }
+        .chatlog__message-group {
+            margin-bottom: 1rem;
+        }
+        .chatlog__message-container {
+            background-color: transparent;
+            transition: background-color 1s ease;
+        }
+        .chatlog__message-container--highlighted {
+            background-color: rgba(114, 137, 218, 0.2);
+        }
+        .chatlog__message {
+            display: grid;
+            grid-template-columns: auto 1fr;
+            padding: 0.15rem 0;
+        }
+        .chatlog__message:hover {
+            background-color: ${hoverBg};
+        }
+        .chatlog__message:hover .chatlog__short-timestamp {
+            display: block;
+        }
+        .chatlog__message-aside {
+            grid-column: 1;
+            width: 72px;
+            padding: 0.15rem 0.15rem 0 0.15rem;
+            text-align: center;
+        }
+        .chatlog__reply-symbol {
+            height: 10px;
+            margin: 6px 4px 4px 36px;
+            border-left: 2px solid ${subText};
+            border-top: 2px solid ${subText};
+            border-radius: 8px 0 0 0;
+        }
+        .chatlog__avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+        }
+        .chatlog__short-timestamp {
+            display: none;
+            color: ${subText};
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+        .chatlog__message-primary {
+            grid-column: 2;
+            min-width: 0;
+        }
+        .chatlog__reply {
+            display: flex;
+            margin-bottom: 0.15rem;
+            align-items: center;
+            color: ${subText};
+            font-size: 0.875rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .chatlog__reply-avatar {
+            width: 16px;
+            height: 16px;
+            margin-right: 0.25rem;
+            border-radius: 50%;
+        }
+        .chatlog__reply-author {
+            margin-right: 0.3rem;
+            font-weight: 600;
+            color: ${authorColor};
+        }
+        .chatlog__reply-content {
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .chatlog__reply-link {
+            cursor: pointer;
+        }
+        .chatlog__reply-link:hover {
+            color: ${authorColor};
+        }
+        .chatlog__header {
+            margin-bottom: 0.1rem;
+        }
+        .chatlog__author {
+            font-weight: 600;
+            color: ${authorColor};
+        }
+        .chatlog__author-tag {
+            position: relative;
+            top: -0.1rem;
+            margin-left: 0.3rem;
+            padding: 0.05rem 0.3rem;
+            border-radius: 3px;
+            background-color: #5865F2;
+            color: #ffffff;
+            font-size: 0.625rem;
+            font-weight: 500;
+        }
+        .chatlog__timestamp {
+            margin-left: 0.3rem;
+            color: ${subText};
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+        .chatlog__timestamp a {
+            color: inherit;
+        }
+        .chatlog__content {
+            padding-right: 1rem;
+            font-size: 0.95rem;
+            word-wrap: break-word;
+            line-height: 1.375;
+        }
+        .chatlog__edited-timestamp {
+            margin-left: 0.15rem;
+            color: ${subText};
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+        .chatlog__attachment {
+            position: relative;
+            width: fit-content;
+            margin-top: 0.3rem;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .chatlog__attachment-media {
+            max-width: 45vw;
+            max-height: 500px;
+            vertical-align: top;
+            border-radius: 3px;
+        }
+        .chatlog__attachment-generic {
+            max-width: 520px;
+            width: 100%;
+            height: 40px;
+            padding: 10px;
+            border: 1px solid ${borderCol};
+            border-radius: 3px;
+            background-color: ${reactionBg};
+            overflow: hidden;
+            margin-top: 4px;
+        }
+        .chatlog__attachment-generic-size {
+            color: ${subText};
+            font-size: 12px;
+        }
+        .chatlog__attachment-generic-name {
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+        }
+        .chatlog__embed {
+            display: flex;
+            margin-top: 0.3rem;
+            max-width: 520px;
+        }
+        .chatlog__embed-color-pill {
+            flex-shrink: 0;
+            width: 0.25rem;
+            border-top-left-radius: 3px;
+            border-bottom-left-radius: 3px;
+        }
+        .chatlog__embed-content-container {
+            display: flex;
+            flex-direction: column;
+            padding: 0.5rem 0.6rem;
+            border: 1px solid ${embedBorder};
+            border-top-right-radius: 3px;
+            border-bottom-right-radius: 3px;
+            background-color: ${embedBg};
+            width: 100%;
+        }
+        .chatlog__embed-content {
+            display: flex;
+            width: 100%;
+        }
+        .chatlog__embed-text {
+            flex: 1;
+        }
+        .chatlog__embed-title {
+            margin-bottom: 0.5rem;
+            color: ${authorColor};
+            font-size: 0.875rem;
+            font-weight: 600;
+        }
+        .chatlog__embed-description {
+            color: ${fg};
+            font-weight: 500;
+            font-size: 0.85rem;
+        }
+        .chatlog__embed-thumbnail {
+            flex: 0;
+            max-width: 80px;
+            max-height: 80px;
+            margin-left: 1.2rem;
+            border-radius: 3px;
+        }
+        .chatlog__embed-images {
+            display: block;
+            margin-top: 0.6rem;
+        }
+        .chatlog__embed-image {
+            object-fit: cover;
+            max-width: 500px;
+            max-height: 400px;
+            border-radius: 3px;
+        }
+        .chatlog__embed-generic-image,
+        .chatlog__embed-generic-gifv {
+            max-width: 45vw;
+            max-height: 500px;
+            border-radius: 3px;
+            vertical-align: top;
+        }
+        .chatlog__sticker {
+            width: 160px;
+            height: 160px;
+            margin-top: 6px;
+        }
+        .chatlog__sticker--media {
+            max-width: 100%;
+            max-height: 100%;
+        }
+        .chatlog__reactions {
+            display: flex;
+            flex-wrap: wrap;
+            margin-top: 4px;
+        }
+        .chatlog__reaction {
+            display: flex;
+            margin: 0.35rem 0.1rem 0.1rem 0;
+            padding: 0.125rem 0.375rem;
+            border: 1px solid transparent;
+            border-radius: 8px;
+            background-color: ${reactionBg};
+            align-items: center;
+        }
+        .chatlog__reaction-count {
+            min-width: 9px;
+            margin-left: 0.35rem;
+            color: ${subText};
+            font-size: 0.875rem;
+        }
+        .chatlog__emoji {
+            width: 1.325rem;
+            height: 1.325rem;
+            margin: 0 0.06rem;
+            vertical-align: -0.4rem;
+        }
+        .chatlog__emoji--small {
+            width: 1rem;
+            height: 1rem;
+        }
+        .postamble {
+            padding: 1.25rem;
+            border-top: 1px solid ${borderCol};
+            color: ${subText};
+            font-size: 0.9rem;
+        }
     </style>
+    <script>
+        function scrollToMessage(event, id) {
+            const element = document.getElementById('chatlog__message-container-' + id);
+            if (!element) return;
+            event.preventDefault();
+            element.classList.add('chatlog__message-container--highlighted');
+            window.scrollTo({
+                top: element.getBoundingClientRect().top - document.body.getBoundingClientRect().top - (window.innerHeight / 2),
+                behavior: 'smooth'
+            });
+            window.setTimeout(() => element.classList.remove('chatlog__message-container--highlighted'), 2000);
+        }
+    </script>
 </head>
 <body>
-    <div class="header">
-        <h1>${sanitizeHtml(channelName)}</h1>
-        <p>Channel ID: ${channelId} | Exported: ${new Date().toLocaleString()} | Total Messages: ${messages.length}</p>
+<div class="preamble">
+    <div class="preamble__entries-container">
+        <div class="preamble__entry">#${sanitizeHtml(channelName)}</div>
+        <div class="preamble__entry preamble__entry--small">Channel ID: ${channelId}</div>
     </div>
-    <div class="chatlog">
-        ${groupsHtml}
-    </div>
+</div>
+<div class="chatlog">
+    ${groupsHtml}
+</div>
+<div class="postamble">
+    Exported ${messages.length.toLocaleString()} messages • ${new Date().toLocaleString()}
+</div>
 </body>
 </html>`;
 }
