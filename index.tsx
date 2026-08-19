@@ -449,6 +449,25 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
             ? `<span style="background: #5865f2; color: #ffffff; font-size: 10px; font-weight: 700; padding: 1px 4px; border-radius: 3px; margin-left: 4px; text-transform: uppercase;">BOT</span>`
             : "";
 
+        const firstMsg = group.messages[0];
+        let replyHeaderHtml = "";
+        if (firstMsg?.referenced_message) {
+            const ref = firstMsg.referenced_message;
+            const refAuthor = ref.author?.global_name || ref.author?.username || "Unknown";
+            const refAvatar = ref.author?.avatar
+                ? `https://cdn.discordapp.com/avatars/${ref.author.id}/${ref.author.avatar}.png?size=32`
+                : "https://cdn.discordapp.com/embed/avatars/0.png";
+            const refContent = sanitizeHtml((ref.content || "").slice(0, 120)) || "Click to see attachment";
+
+            replyHeaderHtml = `
+            <div class="chatlog__reply" style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px; margin-left: 56px; font-size: 13px; color: ${subText}; position: relative;">
+                <div style="position: absolute; left: -36px; top: 8px; width: 30px; height: 12px; border-left: 2px solid ${subText}; border-top: 2px solid ${subText}; border-top-left-radius: 6px; opacity: 0.5;"></div>
+                <img src="${refAvatar}" style="width: 16px; height: 16px; border-radius: 50%;" />
+                <span style="font-weight: 600; color: ${authorColor};">${sanitizeHtml(refAuthor)}</span>
+                <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 480px; opacity: 0.8;">${refContent}</span>
+            </div>`;
+        }
+
         const messagesHtml = group.messages.map((msg, idx) => {
             const content = formatMarkdown(msg.content);
             const msgTime = new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -456,18 +475,18 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
                 ? `<span style="font-size: 10px; color: ${subText}; margin-left: 4px; opacity: 0.7;">(edited)</span>`
                 : "";
 
-            let replyHtml = "";
-            if (msg.referenced_message) {
+            let inlineReply = "";
+            if (idx > 0 && msg.referenced_message) {
                 const ref = msg.referenced_message;
                 const refAuthor = ref.author?.global_name || ref.author?.username || "Unknown";
                 const refAvatar = ref.author?.avatar
                     ? `https://cdn.discordapp.com/avatars/${ref.author.id}/${ref.author.avatar}.png?size=32`
                     : "https://cdn.discordapp.com/embed/avatars/0.png";
                 const refContent = sanitizeHtml((ref.content || "").slice(0, 100)) || "Click to see attachment";
-                replyHtml = `
-                <div class="chatlog__reference" style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-size: 13px; color: ${subText};">
+                inlineReply = `
+                <div class="chatlog__reply" style="display: flex; align-items: center; gap: 6px; margin-bottom: 4px; font-size: 12px; color: ${subText};">
                     <span style="opacity: 0.5;">┌</span>
-                    <img src="${refAvatar}" style="width: 16px; height: 16px; border-radius: 50%;" />
+                    <img src="${refAvatar}" style="width: 14px; height: 14px; border-radius: 50%;" />
                     <span style="font-weight: 600; color: ${authorColor};">${sanitizeHtml(refAuthor)}</span>
                     <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 400px; opacity: 0.8;">${refContent}</span>
                 </div>`;
@@ -476,7 +495,8 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
             let attachmentsHtml = "";
             if (msg.attachments?.length) {
                 attachmentsHtml = msg.attachments.map((a: any) => {
-                    if (a.content_type?.startsWith("image/")) {
+                    const isImg = a.content_type?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(a.filename);
+                    if (isImg) {
                         return `<div style="margin-top: 6px;"><a href="${a.url}" target="_blank"><img src="${a.url}" loading="lazy" style="max-width: 450px; max-height: 350px; border-radius: 8px;"/></a></div>`;
                     }
                     return `<div style="margin-top: 4px;"><a href="${a.url}" target="_blank" style="color: #00a8fc; text-decoration: none; font-size: 14px;">📎 ${sanitizeHtml(a.filename)}</a></div>`;
@@ -493,10 +513,38 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
             let embedsHtml = "";
             if (msg.embeds?.length) {
                 embedsHtml = msg.embeds.map((em: any) => {
-                    const title = em.title ? `<h4 style="margin: 0 0 4px 0; color: ${authorColor}; font-size: 14px;">${sanitizeHtml(em.title)}</h4>` : "";
-                    const desc = em.description ? `<p style="margin: 0; font-size: 13px; line-height: 1.3;">${sanitizeHtml(em.description)}</p>` : "";
+                    if (em.video?.url) {
+                        return `
+                        <div class="chatlog__embed" style="margin-top: 6px; max-width: 450px;">
+                            <video src="${em.video.url}" controls autoplay loop muted playsinline style="max-width: 100%; border-radius: 8px;"></video>
+                        </div>`;
+                    }
+
+                    const imgUrl = em.image?.url || em.thumbnail?.url;
+                    if (em.type === "image" || em.type === "gifv" || (imgUrl && !em.title && !em.description)) {
+                        return `
+                        <div class="chatlog__embed" style="margin-top: 6px; max-width: 450px;">
+                            <a href="${imgUrl || em.url}" target="_blank">
+                                <img src="${imgUrl || em.url}" loading="lazy" style="max-width: 100%; max-height: 350px; border-radius: 8px;" />
+                            </a>
+                        </div>`;
+                    }
+
+                    const title = em.title ? `<h4 style="margin: 0 0 4px 0; color: ${authorColor}; font-size: 14px;"><a href="${em.url || '#'}" target="_blank" style="color: inherit; text-decoration: none;">${sanitizeHtml(em.title)}</a></h4>` : "";
+                    const desc = em.description ? `<p style="margin: 0; font-size: 13px; line-height: 1.3;">${formatMarkdown(em.description)}</p>` : "";
                     const color = em.color ? (em.color).toString(16).padStart(6, "0") : "5865f2";
-                    return `<div style="border-left: 4px solid #${color}; padding: 8px 12px; margin-top: 6px; background: ${embedBg}; border-radius: 4px; max-width: 520px;">${title}${desc}</div>`;
+                    const embedImg = em.image?.url ? `<div style="margin-top: 8px;"><img src="${em.image.url}" loading="lazy" style="max-width: 100%; border-radius: 4px;" /></div>` : "";
+                    const embedThumb = em.thumbnail?.url && !em.image?.url ? `<img src="${em.thumbnail.url}" loading="lazy" style="width: 60px; height: 60px; border-radius: 4px; object-fit: cover; margin-left: 12px;" />` : "";
+
+                    return `
+                    <div class="chatlog__embed" style="display: flex; border-left: 4px solid #${color}; padding: 8px 12px; margin-top: 6px; background: ${embedBg}; border-radius: 4px; max-width: 520px; justify-content: space-between;">
+                        <div>
+                            ${title}
+                            ${desc}
+                            ${embedImg}
+                        </div>
+                        ${embedThumb}
+                    </div>`;
                 }).join("");
             }
 
@@ -515,7 +563,7 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
 
             return `
             <div class="chatlog__message" style="position: relative; margin-top: ${idx === 0 ? "0" : "4px"};">
-                ${replyHtml}
+                ${inlineReply}
                 <span class="chatlog__short-timestamp" style="display: none; position: absolute; left: -56px; font-size: 11px; color: ${subText}; width: 44px; text-align: right;">${msgTime}</span>
                 <div class="chatlog__content" style="font-size: 15px; line-height: 1.375rem; word-break: break-word;">${content}${editedHtml}</div>
                 ${attachmentsHtml}
@@ -526,18 +574,21 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
         }).join("");
 
         return `
-        <div class="chatlog__message-group" style="display: flex; margin-bottom: 16px; padding: 4px 8px 4px 8px; border-radius: 4px;">
-            <div class="chatlog__author-avatar-container" style="width: 40px; height: 40px; margin-right: 16px; flex-shrink: 0;">
-                <img class="chatlog__author-avatar" src="${group.author.avatarUrl}" alt="${sanitizeHtml(group.author.username)}" style="width: 40px; height: 40px; border-radius: 50%; object-fit: cover;" />
-            </div>
-            <div class="chatlog__messages" style="flex-grow: 1; min-width: 0;">
-                <div class="chatlog__header" style="display: flex; align-items: baseline; gap: 6px; margin-bottom: 4px;">
-                    <span class="chatlog__author-name" style="font-weight: 600; color: ${authorColor}; font-size: 15px;">${sanitizeHtml(group.author.name)}</span>
-                    ${botBadge}
-                    <span class="chatlog__author-username" style="font-size: 12px; color: ${subText};">@${sanitizeHtml(group.author.username)}</span>
-                    <span class="chatlog__timestamp" style="font-size: 12px; color: ${subText}; margin-left: 4px;">${timestampStr}</span>
+        <div class="chatlog__message-group" style="margin-bottom: 16px; padding: 4px 8px; border-radius: 4px;">
+            ${replyHeaderHtml}
+            <div style="display: flex;">
+                <div class="chatlog__author-avatar-container" style="width: 40px; height: 40px; margin-right: 16px; flex-shrink: 0;">
+                    <img class="chatlog__author-avatar" src="${group.author.avatarUrl}" alt="${sanitizeHtml(group.author.username)}" style="width: 40px; height: 40px; border-radius: 50%; object-fit: cover;" />
                 </div>
-                ${messagesHtml}
+                <div class="chatlog__messages" style="flex-grow: 1; min-width: 0;">
+                    <div class="chatlog__header" style="display: flex; align-items: baseline; gap: 6px; margin-bottom: 4px;">
+                        <span class="chatlog__author-name" style="font-weight: 600; color: ${authorColor}; font-size: 15px;">${sanitizeHtml(group.author.name)}</span>
+                        ${botBadge}
+                        <span class="chatlog__author-username" style="font-size: 12px; color: ${subText};">@${sanitizeHtml(group.author.username)}</span>
+                        <span class="chatlog__timestamp" style="font-size: 12px; color: ${subText}; margin-left: 4px;">${timestampStr}</span>
+                    </div>
+                    ${messagesHtml}
+                </div>
             </div>
         </div>`;
     }).join("\n");
@@ -554,6 +605,8 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
         .header p { margin: 0; font-size: 14px; color: ${subText}; }
         .chatlog__message-group:hover { background-color: ${hoverBg}; }
         .chatlog__message-group:hover .chatlog__short-timestamp { display: inline-block !important; }
+        video { outline: none; }
+        img { image-rendering: auto; }
     </style>
 </head>
 <body>
