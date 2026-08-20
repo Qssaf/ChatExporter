@@ -913,8 +913,10 @@ async function exportChannelStreaming(
 ): Promise<number> {
     const channelName = getChannelDisplayName(channel);
     const isDark = options.format !== "HtmlLight";
+    const FLUSH_THRESHOLD = 20000;
     let totalMessagesExported = 0;
     let isFirstBatch = true;
+    let writeBuffer: any[] = [];
 
     // 1. Write Header
     if (options.format === "HtmlDark" || options.format === "HtmlLight") {
@@ -927,7 +929,47 @@ async function exportChannelStreaming(
         await writer.write(`====================================================\nChannel: ${channelName} (${channel.id})\nExport Date: ${new Date().toLocaleString()}\n====================================================\n\n`);
     }
 
-    // 2. Stream Batches Directly to Disk
+    const flushDiskBuffer = async () => {
+        if (writeBuffer.length === 0) return;
+
+        if (options.format === "HtmlDark" || options.format === "HtmlLight") {
+            const groups = groupMessages(writeBuffer);
+            const chunkHtml = groups.map(g => renderHtmlMessageGroup(g, isDark)).join("\n");
+            await writer.write(chunkHtml);
+        } else if (options.format === "Json") {
+            const jsonRows = writeBuffer.map(msg => `    ${JSON.stringify(msg)}`).join(",\n");
+            await writer.write((isFirstBatch ? "" : ",\n") + jsonRows);
+        } else if (options.format === "Csv") {
+            const csvRows = writeBuffer.map(msg => {
+                const msgId = `"${msg.id || ""}"`;
+                const authorId = `"${msg.author?.id || ""}"`;
+                const author = `"${(msg.author?.global_name || msg.author?.username || "").replace(/"/g, '""')}"`;
+                const date = `"${new Date(msg.timestamp).toISOString()}"`;
+                const content = `"${(msg.content || "").replace(/"/g, '""')}"`;
+                const attachments = `"${(msg.attachments?.map((a: any) => a.url) || []).join(" ")}"`;
+                const reactions = `"${(msg.reactions?.map((r: any) => `${r.emoji.name}:${r.count}`) || []).join(" ")}"`;
+                const stickers = `"${(msg.sticker_items?.map((s: any) => s.name) || []).join(" ")}"`;
+                const replyTo = `"${msg.referenced_message?.id || ""}"`;
+                return [msgId, authorId, author, date, content, attachments, reactions, stickers, replyTo].join(",");
+            }).join("\n") + "\n";
+            await writer.write(csvRows);
+        } else if (options.format === "PlainText") {
+            const textRows = writeBuffer.map(msg => {
+                const author = msg.author?.global_name || msg.author?.username || "Unknown";
+                const date = new Date(msg.timestamp).toISOString().replace("T", " ").substring(0, 19);
+                let text = `[${date}] ${author}: ${msg.content || ""}`;
+                if (msg.attachments?.length) {
+                    text += `\n  [Attachments: ${msg.attachments.map((a: any) => a.url).join(", ")}]`;
+                }
+                return text;
+            }).join("\n") + "\n";
+            await writer.write(textRows);
+        }
+
+        isFirstBatch = false;
+        writeBuffer = [];
+    };
+
     const beforeSnowflake = options.beforeDate ? dateToSnowflake(new Date(options.beforeDate)) : undefined;
     const afterSnowflake = options.afterDate ? dateToSnowflake(new Date(options.afterDate)) : undefined;
     const maxCount = options.maxMessages && options.maxMessages > 0 ? options.maxMessages : Infinity;
@@ -993,7 +1035,7 @@ async function exportChannelStreaming(
                 pendingFetch = null;
             }
 
-            const batchToWrite: any[] = [];
+            const batchToAdd: any[] = [];
             for (const msg of messages) {
                 if (!isReverse && beforeSnowflake && BigInt(msg.id) >= BigInt(beforeSnowflake)) {
                     break;
@@ -1002,48 +1044,17 @@ async function exportChannelStreaming(
                     break;
                 }
                 if (!options.includeBotMessages && msg.author?.bot) continue;
-                batchToWrite.push(msg);
-                if (totalMessagesExported + batchToWrite.length >= maxCount) break;
+                batchToAdd.push(msg);
+                if (totalMessagesExported + batchToAdd.length >= maxCount) break;
             }
 
-            // Stream write current batch to disk
-            if (batchToWrite.length > 0) {
-                if (options.format === "HtmlDark" || options.format === "HtmlLight") {
-                    const groups = groupMessages(batchToWrite);
-                    const chunkHtml = groups.map(g => renderHtmlMessageGroup(g, isDark)).join("\n");
-                    await writer.write(chunkHtml);
-                } else if (options.format === "Json") {
-                    const jsonRows = batchToWrite.map(msg => `    ${JSON.stringify(msg)}`).join(",\n");
-                    await writer.write((isFirstBatch ? "" : ",\n") + jsonRows);
-                } else if (options.format === "Csv") {
-                    const csvRows = batchToWrite.map(msg => {
-                        const msgId = `"${msg.id || ""}"`;
-                        const authorId = `"${msg.author?.id || ""}"`;
-                        const author = `"${(msg.author?.global_name || msg.author?.username || "").replace(/"/g, '""')}"`;
-                        const date = `"${new Date(msg.timestamp).toISOString()}"`;
-                        const content = `"${(msg.content || "").replace(/"/g, '""')}"`;
-                        const attachments = `"${(msg.attachments?.map((a: any) => a.url) || []).join(" ")}"`;
-                        const reactions = `"${(msg.reactions?.map((r: any) => `${r.emoji.name}:${r.count}`) || []).join(" ")}"`;
-                        const stickers = `"${(msg.sticker_items?.map((s: any) => s.name) || []).join(" ")}"`;
-                        const replyTo = `"${msg.referenced_message?.id || ""}"`;
-                        return [msgId, authorId, author, date, content, attachments, reactions, stickers, replyTo].join(",");
-                    }).join("\n") + "\n";
-                    await writer.write(csvRows);
-                } else if (options.format === "PlainText") {
-                    const textRows = batchToWrite.map(msg => {
-                        const author = msg.author?.global_name || msg.author?.username || "Unknown";
-                        const date = new Date(msg.timestamp).toISOString().replace("T", " ").substring(0, 19);
-                        let text = `[${date}] ${author}: ${msg.content || ""}`;
-                        if (msg.attachments?.length) {
-                            text += `\n  [Attachments: ${msg.attachments.map((a: any) => a.url).join(", ")}]`;
-                        }
-                        return text;
-                    }).join("\n") + "\n";
-                    await writer.write(textRows);
-                }
+            if (batchToAdd.length > 0) {
+                writeBuffer.push(...batchToAdd);
+                totalMessagesExported += batchToAdd.length;
 
-                totalMessagesExported += batchToWrite.length;
-                isFirstBatch = false;
+                if (writeBuffer.length >= FLUSH_THRESHOLD) {
+                    await flushDiskBuffer();
+                }
             }
 
             const now = Date.now();
@@ -1105,7 +1116,10 @@ async function exportChannelStreaming(
         }
     }
 
-    // 3. Finalize Stream on Disk
+    if (writeBuffer.length > 0) {
+        await flushDiskBuffer();
+    }
+
     if (options.format === "HtmlDark" || options.format === "HtmlLight") {
         await writer.write(renderHtmlFooter(totalMessagesExported));
     } else if (options.format === "Json") {
