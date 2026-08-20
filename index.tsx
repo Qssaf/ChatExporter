@@ -89,6 +89,51 @@ function formatDuration(seconds: number): string {
     return `${mins}m ${secs}s`;
 }
 
+interface StreamWriter {
+    write(chunk: string): Promise<void>;
+    close(): Promise<void>;
+}
+
+async function createStreamWriter(suggestedFilename: string, format: ExportFormat): Promise<StreamWriter> {
+    const ext = format === "Json" ? "json" : format === "Csv" ? "csv" : format === "PlainText" ? "txt" : "html";
+    const mime = format === "Json" ? "application/json" : format === "Csv" ? "text/csv" : format === "PlainText" ? "text/plain" : "text/html";
+
+    if (typeof (window as any).showSaveFilePicker === "function") {
+        try {
+            const handle = await (window as any).showSaveFilePicker({
+                suggestedName: suggestedFilename,
+                types: [{
+                    description: `${format} file`,
+                    accept: { [mime]: [`.${ext}`] }
+                }]
+            });
+            const writable = await handle.createWritable();
+            return {
+                async write(chunk: string) {
+                    await writable.write(chunk);
+                },
+                async close() {
+                    await writable.close();
+                }
+            };
+        } catch (e: any) {
+            if (e?.name === "AbortError") {
+                throw { isCanceled: true };
+            }
+        }
+    }
+
+    const buffer: string[] = [];
+    return {
+        async write(chunk: string) {
+            buffer.push(chunk);
+        },
+        async close() {
+            downloadFile(buffer.join(""), suggestedFilename, mime);
+        }
+    };
+}
+
 export interface ActiveExportTask {
     id: string;
     channelName: string;
@@ -255,153 +300,6 @@ async function fetchBatch(channelId: string, query: Record<string, any>, signal?
     });
 }
 
-async function fetchMessagesFast(
-    channelId: string,
-    options: ExportOptions,
-    abortSignal: AbortSignal,
-    onProgress: (progress: ExportProgress) => void
-): Promise<Message[]> {
-    const allMessages: any[] = [];
-    const beforeSnowflake = options.beforeDate ? dateToSnowflake(new Date(options.beforeDate)) : undefined;
-    const afterSnowflake = options.afterDate ? dateToSnowflake(new Date(options.afterDate)) : undefined;
-    const maxCount = options.maxMessages && options.maxMessages > 0 ? options.maxMessages : Infinity;
-    const isReverse = Boolean(options.reverseOrder);
-    const respectRateLimits = options.respectRateLimits !== false;
-
-    if (abortSignal.aborted) throw { isCanceled: true };
-
-    let omegaTimestamp: number | null = null;
-    try {
-        const omegaRes = await fetchBatch(channelId, { limit: 1, ...(beforeSnowflake ? { before: beforeSnowflake } : {}) }, abortSignal);
-        if (omegaRes?.body?.[0]?.timestamp) {
-            omegaTimestamp = new Date(omegaRes.body[0].timestamp).getTime();
-        }
-    } catch (e: any) {
-        if (abortSignal.aborted || e?.name === "AbortError") throw { isCanceled: true };
-    }
-
-    let alphaTimestamp: number | null = null;
-    let currentBoundary = !isReverse ? (afterSnowflake ?? "0") : beforeSnowflake;
-    const startTime = Date.now();
-    let lastProgressUpdate = 0;
-
-    const buildQuery = (boundary: string | undefined, countNeeded: number) => {
-        const query: Record<string, any> = { limit: Math.min(100, countNeeded) };
-        if (!isReverse) {
-            query.after = boundary;
-        } else if (boundary) {
-            query.before = boundary;
-        }
-        return query;
-    };
-
-    let pendingFetch: Promise<any> | null = fetchBatch(channelId, buildQuery(currentBoundary, maxCount - allMessages.length), abortSignal);
-
-    while (allMessages.length < maxCount) {
-        if (abortSignal.aborted || !pendingFetch) throw { isCanceled: true };
-
-        try {
-            const res = await pendingFetch;
-            if (abortSignal.aborted) throw { isCanceled: true };
-
-            let messages: any[] = res?.body ?? [];
-            if (!messages || messages.length === 0) break;
-
-            if (!isReverse) {
-                messages.sort((a, b) => (BigInt(a.id) > BigInt(b.id) ? 1 : -1));
-            } else {
-                messages.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : -1));
-            }
-
-            if (alphaTimestamp === null && messages.length > 0) {
-                alphaTimestamp = new Date(messages[0].timestamp).getTime();
-            }
-
-            const nextBoundary = messages[messages.length - 1].id;
-            const countAfterThis = allMessages.length + messages.length;
-            const hasMore = messages.length === 100 && countAfterThis < maxCount;
-
-            if (hasMore && !abortSignal.aborted) {
-                pendingFetch = fetchBatch(channelId, buildQuery(nextBoundary, maxCount - countAfterThis), abortSignal);
-            } else {
-                pendingFetch = null;
-            }
-
-            for (const msg of messages) {
-                if (!isReverse && beforeSnowflake && BigInt(msg.id) >= BigInt(beforeSnowflake)) {
-                    return allMessages;
-                }
-                if (isReverse && afterSnowflake && BigInt(msg.id) <= BigInt(afterSnowflake)) {
-                    return allMessages;
-                }
-
-                if (!options.includeBotMessages && msg.author?.bot) continue;
-                allMessages.push(msg);
-                if (allMessages.length >= maxCount) break;
-            }
-
-            const now = Date.now();
-            if (now - lastProgressUpdate > 100 || allMessages.length >= maxCount) {
-                const elapsedSec = Math.max(0.1, (now - startTime) / 1000);
-                const rate = Math.round(allMessages.length / elapsedSec);
-
-                let fraction = 0;
-                if (maxCount !== Infinity && maxCount > 0) {
-                    fraction = Math.min(1, allMessages.length / maxCount);
-                } else if (alphaTimestamp !== null && omegaTimestamp !== null && omegaTimestamp > alphaTimestamp) {
-                    const currentMsgTimestamp = new Date(messages[messages.length - 1].timestamp).getTime();
-                    const totalSpan = Math.abs(omegaTimestamp - alphaTimestamp);
-                    const currentSpan = Math.abs(currentMsgTimestamp - alphaTimestamp);
-                    fraction = Math.min(1, Math.max(0, currentSpan / totalSpan));
-                }
-
-                const percent = Math.round(fraction * 100);
-                let etaText = "Estimating...";
-                if (fraction > 0.02 && fraction < 1) {
-                    const totalEstimatedSec = elapsedSec / fraction;
-                    const remainingSec = Math.max(0, totalEstimatedSec - elapsedSec);
-                    etaText = `~${formatDuration(remainingSec)}`;
-                } else if (fraction >= 1) {
-                    etaText = "Finishing...";
-                }
-
-                onProgress({
-                    count: allMessages.length,
-                    rate,
-                    percentage: percent,
-                    etaText
-                });
-                lastProgressUpdate = now;
-            }
-
-            if (!hasMore || !pendingFetch) break;
-
-            currentBoundary = nextBoundary;
-
-            if (respectRateLimits) {
-                const remaining = Number(res?.headers?.["x-ratelimit-remaining"] ?? 5);
-                const resetAfter = Number(res?.headers?.["x-ratelimit-reset-after"] ?? 0);
-                if (remaining === 0 && resetAfter > 0) {
-                    await new Promise(r => setTimeout(r, resetAfter * 1000 + 20));
-                }
-            }
-        } catch (err: any) {
-            if (abortSignal.aborted || err?.isCanceled || err?.name === "AbortError") {
-                throw { isCanceled: true };
-            }
-            if (err?.status === 429) {
-                const retryAfter = (err?.body?.retry_after ?? 1.2) * 1000;
-                await new Promise(r => setTimeout(r, retryAfter + 50));
-                pendingFetch = fetchBatch(channelId, buildQuery(currentBoundary, maxCount - allMessages.length), abortSignal);
-                continue;
-            }
-            throw err;
-        }
-    }
-
-    return isReverse ? allMessages.reverse() : allMessages;
-}
-
 function formatMarkdown(text: string): string {
     if (!text) return "";
     let formatted = sanitizeHtml(text);
@@ -430,8 +328,7 @@ function formatMarkdown(text: string): string {
     return formatted;
 }
 
-function formatHtml(channelName: string, channelId: string, messages: any[], theme: "dark" | "light"): string {
-    const isDark = theme === "dark";
+function renderHtmlHeader(channelName: string, channelId: string, isDark: boolean): string {
     const bg = isDark ? "#36393e" : "#ffffff";
     const fg = isDark ? "#dcddde" : "#23262a";
     const authorColor = isDark ? "#ffffff" : "#2f3136";
@@ -441,204 +338,7 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
     const hoverBg = isDark ? "#32353b" : "#fafafa";
     const embedBg = isDark ? "rgba(46, 48, 54, 0.3)" : "rgba(249, 249, 249, 0.3)";
     const embedBorder = isDark ? "rgba(46, 48, 54, 0.6)" : "rgba(204, 204, 204, 0.3)";
-    const preBg = isDark ? "#2f3136" : "#f9f9f9";
     const reactionBg = isDark ? "#2f3136" : "#f2f3f5";
-
-    const groups = groupMessages(messages);
-
-    const groupsHtml = groups.map(group => {
-        const messagesHtml = group.messages.map((msg, i) => {
-            const isFirst = i === 0;
-            const msgDate = new Date(msg.timestamp);
-            const fullTimestamp = msgDate.toLocaleString();
-            const shortTimestamp = msgDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-            const author = msg.author?.global_name || msg.author?.username || "Unknown";
-            const username = msg.author?.username || "unknown";
-            const isBot = Boolean(msg.author?.bot);
-            const content = formatMarkdown(msg.content);
-            const isReply = Boolean(msg.referenced_message);
-
-            const editedHtml = msg.edited_timestamp
-                ? `<span class="chatlog__edited-timestamp" title="${new Date(msg.edited_timestamp).toLocaleString()}">(edited)</span>`
-                : "";
-
-            let asideHtml = "";
-            if (isFirst) {
-                const replySymbol = isReply ? `<div class="chatlog__reply-symbol"></div>` : "";
-                asideHtml = `
-                <div class="chatlog__message-aside">
-                    ${replySymbol}
-                    <img class="chatlog__avatar" src="${group.author.avatarUrl}" alt="${sanitizeHtml(username)}" loading="lazy" />
-                </div>`;
-            } else {
-                asideHtml = `
-                <div class="chatlog__message-aside">
-                    <div class="chatlog__short-timestamp" title="${fullTimestamp}">${shortTimestamp}</div>
-                </div>`;
-            }
-
-            let replyHtml = "";
-            if (isReply) {
-                const ref = msg.referenced_message;
-                const refAuthor = ref.author?.global_name || ref.author?.username || "Unknown";
-                const refAvatar = ref.author?.avatar
-                    ? `https://cdn.discordapp.com/avatars/${ref.author.id}/${ref.author.avatar}.png?size=32`
-                    : "https://cdn.discordapp.com/embed/avatars/0.png";
-                const refContent = sanitizeHtml((ref.content || "").slice(0, 140)) || "Click to see attachment";
-
-                replyHtml = `
-                <div class="chatlog__reply">
-                    <img class="chatlog__reply-avatar" src="${refAvatar}" alt="Avatar" loading="lazy" />
-                    <div class="chatlog__reply-author">${sanitizeHtml(refAuthor)}</div>
-                    <div class="chatlog__reply-content">
-                        <span class="chatlog__reply-link" onclick="scrollToMessage(event, '${ref.id}')">${refContent}</span>
-                    </div>
-                </div>`;
-            }
-
-            let headerHtml = "";
-            if (isFirst) {
-                const botTag = isBot ? `<span class="chatlog__author-tag">BOT</span>` : "";
-                headerHtml = `
-                <div class="chatlog__header">
-                    <span class="chatlog__author" title="${sanitizeHtml(username)}" data-user-id="${group.author.id}">${sanitizeHtml(author)}</span>
-                    ${botTag}
-                    <span class="chatlog__timestamp" title="${fullTimestamp}"><a href="#chatlog__message-container-${msg.id}">${fullTimestamp}</a></span>
-                </div>`;
-            }
-
-            let attachmentsHtml = "";
-            if (msg.attachments?.length) {
-                attachmentsHtml = msg.attachments.map((att: any) => {
-                    const isImg = att.content_type?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(att.filename);
-                    const isVid = att.content_type?.startsWith("video/") || /\.(mp4|webm|mov)$/i.test(att.filename);
-                    const isAudio = att.content_type?.startsWith("audio/") || /\.(mp3|ogg|wav)$/i.test(att.filename);
-
-                    if (isImg) {
-                        return `
-                        <div class="chatlog__attachment">
-                            <a href="${att.url}" target="_blank">
-                                <img class="chatlog__attachment-media" src="${att.url}" alt="${sanitizeHtml(att.filename)}" loading="lazy" />
-                            </a>
-                        </div>`;
-                    }
-                    if (isVid) {
-                        return `
-                        <div class="chatlog__attachment">
-                            <video class="chatlog__attachment-media" controls>
-                                <source src="${att.url}" type="${att.content_type || 'video/mp4'}" />
-                            </video>
-                        </div>`;
-                    }
-                    if (isAudio) {
-                        return `
-                        <div class="chatlog__attachment">
-                            <audio class="chatlog__attachment-media" controls>
-                                <source src="${att.url}" type="${att.content_type || 'audio/ogg'}" />
-                            </audio>
-                        </div>`;
-                    }
-                    return `
-                    <div class="chatlog__attachment-generic">
-                        <div class="chatlog__attachment-generic-name"><a href="${att.url}" target="_blank">${sanitizeHtml(att.filename)}</a></div>
-                        <div class="chatlog__attachment-generic-size">${att.size ? (att.size / 1024).toFixed(1) + ' KB' : ''}</div>
-                    </div>`;
-                }).join("");
-            }
-
-            let stickersHtml = "";
-            if (msg.sticker_items?.length) {
-                stickersHtml = msg.sticker_items.map((st: any) => `
-                <div class="chatlog__sticker" title="${sanitizeHtml(st.name)}">
-                    <img class="chatlog__sticker--media" src="https://media.discordapp.net/stickers/${st.id}.png?size=160" alt="Sticker" />
-                </div>`).join("");
-            }
-
-            let embedsHtml = "";
-            if (msg.embeds?.length) {
-                embedsHtml = msg.embeds.map((em: any) => {
-                    if (em.video?.url) {
-                        return `
-                        <div class="chatlog__embed">
-                            <video class="chatlog__embed-generic-gifv" width="${em.video.width || 400}" height="${em.video.height || 300}" autoplay loop muted playsinline controls>
-                                <source src="${em.video.url}" />
-                            </video>
-                        </div>`;
-                    }
-
-                    const imgUrl = em.image?.url || em.thumbnail?.url;
-                    if (em.type === "image" || em.type === "gifv" || (imgUrl && !em.title && !em.description)) {
-                        return `
-                        <div class="chatlog__embed">
-                            <a href="${imgUrl || em.url}" target="_blank">
-                                <img class="chatlog__embed-generic-image" src="${imgUrl || em.url}" loading="lazy" alt="Embedded image" />
-                            </a>
-                        </div>`;
-                    }
-
-                    const title = em.title ? `<div class="chatlog__embed-title"><a href="${em.url || '#'}" target="_blank">${sanitizeHtml(em.title)}</a></div>` : "";
-                    const desc = em.description ? `<div class="chatlog__embed-description">${formatMarkdown(em.description)}</div>` : "";
-                    const color = em.color ? (em.color).toString(16).padStart(6, "0") : "202225";
-                    const embedImg = em.image?.url ? `<div class="chatlog__embed-images chatlog__embed-images--single"><img class="chatlog__embed-image" src="${em.image.url}" loading="lazy" /></div>` : "";
-                    const embedThumb = em.thumbnail?.url && !em.image?.url ? `<img class="chatlog__embed-thumbnail" src="${em.thumbnail.url}" loading="lazy" />` : "";
-
-                    return `
-                    <div class="chatlog__embed">
-                        <div class="chatlog__embed-color-pill" style="background-color: #${color};"></div>
-                        <div class="chatlog__embed-content-container">
-                            <div class="chatlog__embed-content">
-                                <div class="chatlog__embed-text">
-                                    ${title}
-                                    ${desc}
-                                    ${embedImg}
-                                </div>
-                                ${embedThumb}
-                            </div>
-                        </div>
-                    </div>`;
-                }).join("");
-            }
-
-            let reactionsHtml = "";
-            if (msg.reactions?.length) {
-                reactionsHtml = `
-                <div class="chatlog__reactions">` +
-                    msg.reactions.map((r: any) => {
-                        const emojiUrl = r.emoji?.id ? `https://cdn.discordapp.com/emojis/${r.emoji.id}.png?size=32` : null;
-                        const emojiElem = emojiUrl
-                            ? `<img class="chatlog__emoji chatlog__emoji--small" src="${emojiUrl}" alt="${sanitizeHtml(r.emoji.name)}" />`
-                            : `<span>${r.emoji?.name || "👍"}</span>`;
-                        return `
-                        <div class="chatlog__reaction">
-                            ${emojiElem}
-                            <span class="chatlog__reaction-count">${r.count}</span>
-                        </div>`;
-                    }).join("") +
-                `</div>`;
-            }
-
-            return `
-            <div id="chatlog__message-container-${msg.id}" class="chatlog__message-container" data-message-id="${msg.id}">
-                <div class="chatlog__message">
-                    ${asideHtml}
-                    <div class="chatlog__message-primary">
-                        ${replyHtml}
-                        ${headerHtml}
-                        ${content ? `<div class="chatlog__content chatlog__markdown"><span class="chatlog__markdown-preserve">${content}</span>${editedHtml}</div>` : ""}
-                        ${attachmentsHtml}
-                        ${stickersHtml}
-                        ${embedsHtml}
-                        ${reactionsHtml}
-                    </div>
-                </div>
-            </div>`;
-        }).join("");
-
-        return `
-        <div class="chatlog__message-group">
-            ${messagesHtml}
-        </div>`;
-    }).join("\n");
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -738,7 +438,7 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
             margin: 6px 4px 4px 36px;
             border-left: 2px solid ${subText};
             border-top: 2px solid ${subText};
-            border-radius: 8px 0 0 0;
+            border-top-left-radius: 8px;
         }
         .chatlog__avatar {
             width: 40px;
@@ -989,44 +689,431 @@ function formatHtml(channelName: string, channelId: string, messages: any[], the
     </div>
 </div>
 <div class="chatlog">
-    ${groupsHtml}
+`;
+}
+
+function renderHtmlMessageGroup(group: MessageGroup, isDark: boolean): string {
+    const authorColor = isDark ? "#ffffff" : "#2f3136";
+    const subText = isDark ? "#a3a6aa" : "#5e6772";
+    const embedBg = isDark ? "rgba(46, 48, 54, 0.3)" : "rgba(249, 249, 249, 0.3)";
+    const embedBorder = isDark ? "rgba(46, 48, 54, 0.6)" : "rgba(204, 204, 204, 0.3)";
+    const borderCol = isDark ? "rgba(255, 255, 255, 0.1)" : "#eceeef";
+    const reactionBg = isDark ? "#2f3136" : "#f2f3f5";
+    const fg = isDark ? "#dcddde" : "#23262a";
+
+    const messagesHtml = group.messages.map((msg, i) => {
+        const isFirst = i === 0;
+        const msgDate = new Date(msg.timestamp);
+        const fullTimestamp = msgDate.toLocaleString();
+        const shortTimestamp = msgDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        const author = msg.author?.global_name || msg.author?.username || "Unknown";
+        const username = msg.author?.username || "unknown";
+        const isBot = Boolean(msg.author?.bot);
+        const content = formatMarkdown(msg.content);
+        const isReply = Boolean(msg.referenced_message);
+
+        const editedHtml = msg.edited_timestamp
+            ? `<span class="chatlog__edited-timestamp" title="${new Date(msg.edited_timestamp).toLocaleString()}">(edited)</span>`
+            : "";
+
+        let asideHtml = "";
+        if (isFirst) {
+            const replySymbol = isReply ? `<div class="chatlog__reply-symbol"></div>` : "";
+            asideHtml = `
+            <div class="chatlog__message-aside">
+                ${replySymbol}
+                <img class="chatlog__avatar" src="${group.author.avatarUrl}" alt="${sanitizeHtml(username)}" loading="lazy" />
+            </div>`;
+        } else {
+            asideHtml = `
+            <div class="chatlog__message-aside">
+                <div class="chatlog__short-timestamp" title="${fullTimestamp}">${shortTimestamp}</div>
+            </div>`;
+        }
+
+        let replyHtml = "";
+        if (isReply) {
+            const ref = msg.referenced_message;
+            const refAuthor = ref.author?.global_name || ref.author?.username || "Unknown";
+            const refAvatar = ref.author?.avatar
+                ? `https://cdn.discordapp.com/avatars/${ref.author.id}/${ref.author.avatar}.png?size=32`
+                : "https://cdn.discordapp.com/embed/avatars/0.png";
+            const refContent = sanitizeHtml((ref.content || "").slice(0, 140)) || "Click to see attachment";
+
+            replyHtml = `
+            <div class="chatlog__reply">
+                <img class="chatlog__reply-avatar" src="${refAvatar}" alt="Avatar" loading="lazy" />
+                <div class="chatlog__reply-author">${sanitizeHtml(refAuthor)}</div>
+                <div class="chatlog__reply-content">
+                    <span class="chatlog__reply-link" onclick="scrollToMessage(event, '${ref.id}')">${refContent}</span>
+                </div>
+            </div>`;
+        }
+
+        let headerHtml = "";
+        if (isFirst) {
+            const botTag = isBot ? `<span class="chatlog__author-tag">BOT</span>` : "";
+            headerHtml = `
+            <div class="chatlog__header">
+                <span class="chatlog__author" title="${sanitizeHtml(username)}" data-user-id="${group.author.id}">${sanitizeHtml(author)}</span>
+                ${botTag}
+                <span class="chatlog__timestamp" title="${fullTimestamp}"><a href="#chatlog__message-container-${msg.id}">${fullTimestamp}</a></span>
+            </div>`;
+        }
+
+        let attachmentsHtml = "";
+        if (msg.attachments?.length) {
+            attachmentsHtml = msg.attachments.map((att: any) => {
+                const isImg = att.content_type?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(att.filename);
+                const isVid = att.content_type?.startsWith("video/") || /\.(mp4|webm|mov)$/i.test(att.filename);
+                const isAudio = att.content_type?.startsWith("audio/") || /\.(mp3|ogg|wav)$/i.test(att.filename);
+
+                if (isImg) {
+                    return `
+                    <div class="chatlog__attachment">
+                        <a href="${att.url}" target="_blank">
+                            <img class="chatlog__attachment-media" src="${att.url}" alt="${sanitizeHtml(att.filename)}" loading="lazy" />
+                        </a>
+                    </div>`;
+                }
+                if (isVid) {
+                    return `
+                    <div class="chatlog__attachment">
+                        <video class="chatlog__attachment-media" controls>
+                            <source src="${att.url}" type="${att.content_type || 'video/mp4'}" />
+                        </video>
+                    </div>`;
+                }
+                if (isAudio) {
+                    return `
+                    <div class="chatlog__attachment">
+                        <audio class="chatlog__attachment-media" controls>
+                            <source src="${att.url}" type="${att.content_type || 'audio/ogg'}" />
+                        </audio>
+                    </div>`;
+                }
+                return `
+                <div class="chatlog__attachment-generic">
+                    <div class="chatlog__attachment-generic-name"><a href="${att.url}" target="_blank">${sanitizeHtml(att.filename)}</a></div>
+                    <div class="chatlog__attachment-generic-size">${att.size ? (att.size / 1024).toFixed(1) + ' KB' : ''}</div>
+                </div>`;
+            }).join("");
+        }
+
+        let stickersHtml = "";
+        if (msg.sticker_items?.length) {
+            stickersHtml = msg.sticker_items.map((st: any) => `
+            <div class="chatlog__sticker" title="${sanitizeHtml(st.name)}">
+                <img class="chatlog__sticker--media" src="https://media.discordapp.net/stickers/${st.id}.png?size=160" alt="Sticker" />
+            </div>`).join("");
+        }
+
+        let embedsHtml = "";
+        if (msg.embeds?.length) {
+            embedsHtml = msg.embeds.map((em: any) => {
+                if (em.video?.url) {
+                    return `
+                    <div class="chatlog__embed">
+                        <video class="chatlog__embed-generic-gifv" width="${em.video.width || 400}" height="${em.video.height || 300}" autoplay loop muted playsinline controls>
+                            <source src="${em.video.url}" />
+                        </video>
+                    </div>`;
+                }
+
+                const imgUrl = em.image?.url || em.thumbnail?.url;
+                if (em.type === "image" || em.type === "gifv" || (imgUrl && !em.title && !em.description)) {
+                    return `
+                    <div class="chatlog__embed">
+                        <a href="${imgUrl || em.url}" target="_blank">
+                            <img class="chatlog__embed-generic-image" src="${imgUrl || em.url}" loading="lazy" alt="Embedded image" />
+                        </a>
+                    </div>`;
+                }
+
+                const title = em.title ? `<div class="chatlog__embed-title"><a href="${em.url || '#'}" target="_blank">${sanitizeHtml(em.title)}</a></div>` : "";
+                const desc = em.description ? `<div class="chatlog__embed-description">${formatMarkdown(em.description)}</div>` : "";
+                const color = em.color ? (em.color).toString(16).padStart(6, "0") : "202225";
+                const embedImg = em.image?.url ? `<div class="chatlog__embed-images chatlog__embed-images--single"><img class="chatlog__embed-image" src="${em.image.url}" loading="lazy" /></div>` : "";
+                const embedThumb = em.thumbnail?.url && !em.image?.url ? `<img class="chatlog__embed-thumbnail" src="${em.thumbnail.url}" loading="lazy" />` : "";
+
+                return `
+                <div class="chatlog__embed">
+                    <div class="chatlog__embed-color-pill" style="background-color: #${color};"></div>
+                    <div class="chatlog__embed-content-container">
+                        <div class="chatlog__embed-content">
+                            <div class="chatlog__embed-text">
+                                ${title}
+                                ${desc}
+                                ${embedImg}
+                            </div>
+                            ${embedThumb}
+                        </div>
+                    </div>
+                </div>`;
+            }).join("");
+        }
+
+        let reactionsHtml = "";
+        if (msg.reactions?.length) {
+            reactionsHtml = `
+            <div class="chatlog__reactions">` +
+                msg.reactions.map((r: any) => {
+                    const emojiUrl = r.emoji?.id ? `https://cdn.discordapp.com/emojis/${r.emoji.id}.png?size=32` : null;
+                    const emojiElem = emojiUrl
+                        ? `<img class="chatlog__emoji chatlog__emoji--small" src="${emojiUrl}" alt="${sanitizeHtml(r.emoji.name)}" />`
+                        : `<span>${r.emoji?.name || "👍"}</span>`;
+                    return `
+                    <div class="chatlog__reaction">
+                        ${emojiElem}
+                        <span class="chatlog__reaction-count">${r.count}</span>
+                    </div>`;
+                }).join("") +
+            `</div>`;
+        }
+
+        return `
+        <div id="chatlog__message-container-${msg.id}" class="chatlog__message-container" data-message-id="${msg.id}">
+            <div class="chatlog__message">
+                ${asideHtml}
+                <div class="chatlog__message-primary">
+                    ${replyHtml}
+                    ${headerHtml}
+                    ${content ? `<div class="chatlog__content chatlog__markdown"><span class="chatlog__markdown-preserve">${content}</span>${editedHtml}</div>` : ""}
+                    ${attachmentsHtml}
+                    ${stickersHtml}
+                    ${embedsHtml}
+                    ${reactionsHtml}
+                </div>
+            </div>
+        </div>`;
+    }).join("");
+
+    return `
+    <div class="chatlog__message-group">
+        ${messagesHtml}
+    </div>`;
+}
+
+function renderHtmlFooter(totalCount: number): string {
+    return `
 </div>
 <div class="postamble">
-    Exported ${messages.length.toLocaleString()} messages • ${new Date().toLocaleString()}
+    Exported ${totalCount.toLocaleString()} messages • ${new Date().toLocaleString()}
 </div>
 </body>
 </html>`;
 }
 
-function formatCsv(messages: any[]): string {
-    const header = ["MessageID", "AuthorID", "Author", "Date", "Content", "Attachments", "Reactions", "Stickers", "ReplyTo"].join(",");
-    const rows = messages.map(msg => {
-        const msgId = `"${msg.id || ""}"`;
-        const authorId = `"${msg.author?.id || ""}"`;
-        const author = `"${(msg.author?.global_name || msg.author?.username || "").replace(/"/g, '""')}"`;
-        const date = `"${new Date(msg.timestamp).toISOString()}"`;
-        const content = `"${(msg.content || "").replace(/"/g, '""')}"`;
-        const attachments = `"${(msg.attachments?.map((a: any) => a.url) || []).join(" ")}"`;
-        const reactions = `"${(msg.reactions?.map((r: any) => `${r.emoji.name}:${r.count}`) || []).join(" ")}"`;
-        const stickers = `"${(msg.sticker_items?.map((s: any) => s.name) || []).join(" ")}"`;
-        const replyTo = `"${msg.referenced_message?.id || ""}"`;
-        return [msgId, authorId, author, date, content, attachments, reactions, stickers, replyTo].join(",");
-    });
-    return [header, ...rows].join("\n");
-}
+async function exportChannelStreaming(
+    channel: Channel,
+    options: ExportOptions,
+    writer: StreamWriter,
+    abortSignal: AbortSignal,
+    onProgress: (progress: ExportProgress) => void
+): Promise<number> {
+    const channelName = getChannelDisplayName(channel);
+    const isDark = options.format !== "HtmlLight";
+    let totalMessagesExported = 0;
+    let isFirstBatch = true;
 
-function formatPlainText(channelName: string, channelId: string, messages: any[]): string {
-    const header = `====================================================\nChannel: ${channelName} (${channelId})\nExport Date: ${new Date().toLocaleString()}\nTotal Messages: ${messages.length}\n====================================================\n\n`;
-    const lines = messages.map(msg => {
-        const author = msg.author?.global_name || msg.author?.username || "Unknown";
-        const date = new Date(msg.timestamp).toISOString().replace("T", " ").substring(0, 19);
-        let text = `[${date}] ${author}: ${msg.content || ""}`;
-        if (msg.attachments?.length) {
-            text += `\n  [Attachments: ${msg.attachments.map((a: any) => a.url).join(", ")}]`;
+    // 1. Write Header
+    if (options.format === "HtmlDark" || options.format === "HtmlLight") {
+        await writer.write(renderHtmlHeader(channelName, channel.id, isDark));
+    } else if (options.format === "Json") {
+        await writer.write(`{\n  "channel": ${JSON.stringify({ id: channel.id, name: channelName })},\n  "messages": [\n`);
+    } else if (options.format === "Csv") {
+        await writer.write("MessageID,AuthorID,Author,Date,Content,Attachments,Reactions,Stickers,ReplyTo\n");
+    } else if (options.format === "PlainText") {
+        await writer.write(`====================================================\nChannel: ${channelName} (${channel.id})\nExport Date: ${new Date().toLocaleString()}\n====================================================\n\n`);
+    }
+
+    // 2. Stream Batches Directly to Disk
+    const beforeSnowflake = options.beforeDate ? dateToSnowflake(new Date(options.beforeDate)) : undefined;
+    const afterSnowflake = options.afterDate ? dateToSnowflake(new Date(options.afterDate)) : undefined;
+    const maxCount = options.maxMessages && options.maxMessages > 0 ? options.maxMessages : Infinity;
+    const isReverse = Boolean(options.reverseOrder);
+    const respectRateLimits = options.respectRateLimits !== false;
+
+    if (abortSignal.aborted) throw { isCanceled: true };
+
+    let omegaTimestamp: number | null = null;
+    try {
+        const omegaRes = await fetchBatch(channel.id, { limit: 1, ...(beforeSnowflake ? { before: beforeSnowflake } : {}) }, abortSignal);
+        if (omegaRes?.body?.[0]?.timestamp) {
+            omegaTimestamp = new Date(omegaRes.body[0].timestamp).getTime();
         }
-        return text;
-    });
-    return header + lines.join("\n");
+    } catch (e: any) {
+        if (abortSignal.aborted || e?.name === "AbortError") throw { isCanceled: true };
+    }
+
+    let alphaTimestamp: number | null = null;
+    let currentBoundary = !isReverse ? (afterSnowflake ?? "0") : beforeSnowflake;
+    const startTime = Date.now();
+    let lastProgressUpdate = 0;
+
+    const buildQuery = (boundary: string | undefined, countNeeded: number) => {
+        const query: Record<string, any> = { limit: Math.min(100, countNeeded) };
+        if (!isReverse) {
+            query.after = boundary;
+        } else if (boundary) {
+            query.before = boundary;
+        }
+        return query;
+    };
+
+    let pendingFetch: Promise<any> | null = fetchBatch(channel.id, buildQuery(currentBoundary, maxCount - totalMessagesExported), abortSignal);
+
+    while (totalMessagesExported < maxCount) {
+        if (abortSignal.aborted || !pendingFetch) throw { isCanceled: true };
+
+        try {
+            const res = await pendingFetch;
+            if (abortSignal.aborted) throw { isCanceled: true };
+
+            let messages: any[] = res?.body ?? [];
+            if (!messages || messages.length === 0) break;
+
+            if (!isReverse) {
+                messages.sort((a, b) => (BigInt(a.id) > BigInt(b.id) ? 1 : -1));
+            } else {
+                messages.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : -1));
+            }
+
+            if (alphaTimestamp === null && messages.length > 0) {
+                alphaTimestamp = new Date(messages[0].timestamp).getTime();
+            }
+
+            const nextBoundary = messages[messages.length - 1].id;
+            const countAfterThis = totalMessagesExported + messages.length;
+            const hasMore = messages.length === 100 && countAfterThis < maxCount;
+
+            if (hasMore && !abortSignal.aborted) {
+                pendingFetch = fetchBatch(channel.id, buildQuery(nextBoundary, maxCount - countAfterThis), abortSignal);
+            } else {
+                pendingFetch = null;
+            }
+
+            const batchToWrite: any[] = [];
+            for (const msg of messages) {
+                if (!isReverse && beforeSnowflake && BigInt(msg.id) >= BigInt(beforeSnowflake)) {
+                    break;
+                }
+                if (isReverse && afterSnowflake && BigInt(msg.id) <= BigInt(afterSnowflake)) {
+                    break;
+                }
+                if (!options.includeBotMessages && msg.author?.bot) continue;
+                batchToWrite.push(msg);
+                if (totalMessagesExported + batchToWrite.length >= maxCount) break;
+            }
+
+            // Stream write current batch to disk
+            if (batchToWrite.length > 0) {
+                if (options.format === "HtmlDark" || options.format === "HtmlLight") {
+                    const groups = groupMessages(batchToWrite);
+                    const chunkHtml = groups.map(g => renderHtmlMessageGroup(g, isDark)).join("\n");
+                    await writer.write(chunkHtml);
+                } else if (options.format === "Json") {
+                    const jsonRows = batchToWrite.map(msg => `    ${JSON.stringify(msg)}`).join(",\n");
+                    await writer.write((isFirstBatch ? "" : ",\n") + jsonRows);
+                } else if (options.format === "Csv") {
+                    const csvRows = batchToWrite.map(msg => {
+                        const msgId = `"${msg.id || ""}"`;
+                        const authorId = `"${msg.author?.id || ""}"`;
+                        const author = `"${(msg.author?.global_name || msg.author?.username || "").replace(/"/g, '""')}"`;
+                        const date = `"${new Date(msg.timestamp).toISOString()}"`;
+                        const content = `"${(msg.content || "").replace(/"/g, '""')}"`;
+                        const attachments = `"${(msg.attachments?.map((a: any) => a.url) || []).join(" ")}"`;
+                        const reactions = `"${(msg.reactions?.map((r: any) => `${r.emoji.name}:${r.count}`) || []).join(" ")}"`;
+                        const stickers = `"${(msg.sticker_items?.map((s: any) => s.name) || []).join(" ")}"`;
+                        const replyTo = `"${msg.referenced_message?.id || ""}"`;
+                        return [msgId, authorId, author, date, content, attachments, reactions, stickers, replyTo].join(",");
+                    }).join("\n") + "\n";
+                    await writer.write(csvRows);
+                } else if (options.format === "PlainText") {
+                    const textRows = batchToWrite.map(msg => {
+                        const author = msg.author?.global_name || msg.author?.username || "Unknown";
+                        const date = new Date(msg.timestamp).toISOString().replace("T", " ").substring(0, 19);
+                        let text = `[${date}] ${author}: ${msg.content || ""}`;
+                        if (msg.attachments?.length) {
+                            text += `\n  [Attachments: ${msg.attachments.map((a: any) => a.url).join(", ")}]`;
+                        }
+                        return text;
+                    }).join("\n") + "\n";
+                    await writer.write(textRows);
+                }
+
+                totalMessagesExported += batchToWrite.length;
+                isFirstBatch = false;
+            }
+
+            const now = Date.now();
+            if (now - lastProgressUpdate > 100 || totalMessagesExported >= maxCount) {
+                const elapsedSec = Math.max(0.1, (now - startTime) / 1000);
+                const rate = Math.round(totalMessagesExported / elapsedSec);
+
+                let fraction = 0;
+                if (maxCount !== Infinity && maxCount > 0) {
+                    fraction = Math.min(1, totalMessagesExported / maxCount);
+                } else if (alphaTimestamp !== null && omegaTimestamp !== null && omegaTimestamp > alphaTimestamp) {
+                    const currentMsgTimestamp = new Date(messages[messages.length - 1].timestamp).getTime();
+                    const totalSpan = Math.abs(omegaTimestamp - alphaTimestamp);
+                    const currentSpan = Math.abs(currentMsgTimestamp - alphaTimestamp);
+                    fraction = Math.min(1, Math.max(0, currentSpan / totalSpan));
+                }
+
+                const percent = Math.round(fraction * 100);
+                let etaText = "Estimating...";
+                if (fraction > 0.02 && fraction < 1) {
+                    const totalEstimatedSec = elapsedSec / fraction;
+                    const remainingSec = Math.max(0, totalEstimatedSec - elapsedSec);
+                    etaText = `~${formatDuration(remainingSec)}`;
+                } else if (fraction >= 1) {
+                    etaText = "Finishing...";
+                }
+
+                onProgress({
+                    count: totalMessagesExported,
+                    rate,
+                    percentage: percent,
+                    etaText
+                });
+                lastProgressUpdate = now;
+            }
+
+            if (!hasMore || !pendingFetch) break;
+
+            currentBoundary = nextBoundary;
+
+            if (respectRateLimits) {
+                const remaining = Number(res?.headers?.["x-ratelimit-remaining"] ?? 5);
+                const resetAfter = Number(res?.headers?.["x-ratelimit-reset-after"] ?? 0);
+                if (remaining === 0 && resetAfter > 0) {
+                    await new Promise(r => setTimeout(r, resetAfter * 1000 + 20));
+                }
+            }
+        } catch (err: any) {
+            if (abortSignal.aborted || err?.isCanceled || err?.name === "AbortError") {
+                throw { isCanceled: true };
+            }
+            if (err?.status === 429) {
+                const retryAfter = (err?.body?.retry_after ?? 1.2) * 1000;
+                await new Promise(r => setTimeout(r, retryAfter + 50));
+                pendingFetch = fetchBatch(channel.id, buildQuery(currentBoundary, maxCount - totalMessagesExported), abortSignal);
+                continue;
+            }
+            throw err;
+        }
+    }
+
+    // 3. Finalize Stream on Disk
+    if (options.format === "HtmlDark" || options.format === "HtmlLight") {
+        await writer.write(renderHtmlFooter(totalMessagesExported));
+    } else if (options.format === "Json") {
+        await writer.write(`\n  ],\n  "messageCount": ${totalMessagesExported}\n}\n`);
+    }
+    await writer.close();
+
+    return totalMessagesExported;
 }
 
 function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalProps: RenderModalProps; }) {
@@ -1048,6 +1135,21 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
     const channelName = getChannelDisplayName(channel);
 
     const handleStartExport = async () => {
+        const safeName = channelName.replace(/[^a-z0-9_-]/gi, "_").toLowerCase();
+        const dateStr = new Date().toISOString().substring(0, 10);
+        const ext = format === "Json" ? "json" : format === "Csv" ? "csv" : format === "PlainText" ? "txt" : "html";
+        const filename = `${safeName}_${dateStr}.${ext}`;
+
+        let writer: StreamWriter;
+        try {
+            // Prompt user for save destination BEFORE starting export
+            writer = await createStreamWriter(filename, format);
+        } catch (e: any) {
+            if (e?.isCanceled) return;
+            console.error("[ChatExporter] Save picker canceled:", e);
+            return;
+        }
+
         const taskId = `${channel.id}-${Date.now()}`;
         const controller = new AbortController();
         const initialProgress: ExportProgress = { count: 0, rate: 0, percentage: 0, etaText: "Estimating..." };
@@ -1064,8 +1166,8 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
         setProgress(initialProgress);
 
         try {
-            const messages = await fetchMessagesFast(
-                channel.id,
+            const count = await exportChannelStreaming(
+                channel,
                 {
                     format,
                     afterDate: afterDate || undefined,
@@ -1074,6 +1176,7 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                     includeBotMessages: includeBots,
                     respectRateLimits: !hyperSpeed,
                 },
+                writer,
                 controller.signal,
                 p => {
                     setProgress(p);
@@ -1090,37 +1193,7 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                 return;
             }
 
-            if (messages.length === 0) {
-                showToast("No messages found matching your criteria.", Toasts.Type.WARNING);
-                return;
-            }
-
-            const safeName = channelName.replace(/[^a-z0-9_-]/gi, "_").toLowerCase();
-            const dateStr = new Date().toISOString().substring(0, 10);
-
-            switch (format) {
-                case "HtmlDark":
-                    downloadFile(formatHtml(channelName, channel.id, messages, "dark"), `${safeName}_${dateStr}.html`, "text/html");
-                    break;
-                case "HtmlLight":
-                    downloadFile(formatHtml(channelName, channel.id, messages, "light"), `${safeName}_${dateStr}.html`, "text/html");
-                    break;
-                case "Json":
-                    downloadFile(
-                        JSON.stringify({ channel: { id: channel.id, name: channelName }, count: messages.length, messages }, null, 2),
-                        `${safeName}_${dateStr}.json`,
-                        "application/json"
-                    );
-                    break;
-                case "Csv":
-                    downloadFile(formatCsv(messages), `${safeName}_${dateStr}.csv`, "text/csv");
-                    break;
-                case "PlainText":
-                    downloadFile(formatPlainText(channelName, channel.id, messages), `${safeName}_${dateStr}.txt`, "text/plain");
-                    break;
-            }
-
-            showToast(`Exported ${messages.length.toLocaleString()} messages successfully!`, Toasts.Type.SUCCESS);
+            showToast(`Exported ${count.toLocaleString()} messages successfully!`, Toasts.Type.SUCCESS);
             modalProps.onClose();
         } catch (err: any) {
             if (controller.signal.aborted || err?.isCanceled) {
@@ -1159,7 +1232,7 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                     onClick: modalProps.onClose
                 },
                 {
-                    text: "Export",
+                    text: "Save & Export",
                     variant: "primary",
                     onClick: handleStartExport
                 }
