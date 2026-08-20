@@ -322,17 +322,30 @@ async function fetchBatch(channelId: string, query: Record<string, any>, signal?
 
 async function fetchForumThreads(channelId: string, includeArchived: boolean, signal: AbortSignal): Promise<Channel[]> {
     const threads: Channel[] = [];
+    const threadIdSet = new Set<string>();
 
-    try {
-        const activeRes = await fetchBatch(channelId, {}, signal, `https://discord.com/api/v10/channels/${channelId}/threads/active`);
-        if (activeRes?.body?.threads) {
-            threads.push(...activeRes.body.threads);
+    const addThreads = (list: Channel[]) => {
+        for (const t of list) {
+            if (!threadIdSet.has(t.id)) {
+                threadIdSet.add(t.id);
+                threads.push(t);
+            }
         }
-    } catch (e) {
-        console.warn("[ChatExporter] Error fetching active threads:", e);
-    }
+    };
 
-    if (includeArchived) {
+    const activePromise = (async () => {
+        try {
+            const activeRes = await fetchBatch(channelId, {}, signal, `https://discord.com/api/v10/channels/${channelId}/threads/active`);
+            if (activeRes?.body?.threads) {
+                addThreads(activeRes.body.threads);
+            }
+        } catch (e) {
+            console.warn("[ChatExporter] Error fetching active threads:", e);
+        }
+    })();
+
+    const archivedPromise = (async () => {
+        if (!includeArchived) return;
         let beforeTimestamp: string | undefined = undefined;
         let hasMore = true;
 
@@ -349,7 +362,7 @@ async function fetchForumThreads(channelId: string, includeArchived: boolean, si
                 const batch = archivedRes?.body?.threads ?? [];
                 if (batch.length === 0) break;
 
-                threads.push(...batch);
+                addThreads(batch);
                 hasMore = Boolean(archivedRes?.body?.has_more && batch.length >= 100);
                 if (hasMore) {
                     beforeTimestamp = batch[batch.length - 1].thread_metadata?.archive_timestamp;
@@ -359,8 +372,9 @@ async function fetchForumThreads(channelId: string, includeArchived: boolean, si
                 break;
             }
         }
-    }
+    })();
 
+    await Promise.all([activePromise, archivedPromise]);
     return threads;
 }
 
@@ -368,7 +382,7 @@ async function fetchMessagesFast(
     channelId: string,
     options: ExportOptions,
     abortSignal: AbortSignal,
-    onProgress: (progress: ExportProgress) => void
+    onBatch?: (newBatch: any[]) => void
 ): Promise<Message[]> {
     const allMessages: any[] = [];
     const beforeSnowflake = options.beforeDate ? dateToSnowflake(new Date(options.beforeDate)) : undefined;
@@ -379,20 +393,7 @@ async function fetchMessagesFast(
 
     if (abortSignal.aborted) throw { isCanceled: true };
 
-    let omegaTimestamp: number | null = null;
-    try {
-        const omegaRes = await fetchBatch(channelId, { limit: 1, ...(beforeSnowflake ? { before: beforeSnowflake } : {}) }, abortSignal);
-        if (omegaRes?.body?.[0]?.timestamp) {
-            omegaTimestamp = new Date(omegaRes.body[0].timestamp).getTime();
-        }
-    } catch (e: any) {
-        if (abortSignal.aborted || e?.name === "AbortError") throw { isCanceled: true };
-    }
-
-    let alphaTimestamp: number | null = null;
     let currentBoundary = !isReverse ? (afterSnowflake ?? "0") : beforeSnowflake;
-    const startTime = Date.now();
-    let lastProgressUpdate = 0;
 
     const buildQuery = (boundary: string | undefined, countNeeded: number) => {
         const query: Record<string, any> = { limit: Math.min(100, countNeeded) };
@@ -422,10 +423,6 @@ async function fetchMessagesFast(
                 messages.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : -1));
             }
 
-            if (alphaTimestamp === null && messages.length > 0) {
-                alphaTimestamp = new Date(messages[0].timestamp).getTime();
-            }
-
             const nextBoundary = messages[messages.length - 1].id;
             const countAfterThis = allMessages.length + messages.length;
             const hasMore = messages.length === 100 && countAfterThis < maxCount;
@@ -436,54 +433,29 @@ async function fetchMessagesFast(
                 pendingFetch = null;
             }
 
+            const batchToAdd: any[] = [];
+            let reachedBoundary = false;
             for (const msg of messages) {
                 if (!isReverse && beforeSnowflake && BigInt(msg.id) >= BigInt(beforeSnowflake)) {
-                    return allMessages;
+                    reachedBoundary = true;
+                    break;
                 }
                 if (isReverse && afterSnowflake && BigInt(msg.id) <= BigInt(afterSnowflake)) {
-                    return allMessages;
+                    reachedBoundary = true;
+                    break;
                 }
 
                 if (!options.includeBotMessages && msg.author?.bot) continue;
-                allMessages.push(msg);
-                if (allMessages.length >= maxCount) break;
+                batchToAdd.push(msg);
+                if (allMessages.length + batchToAdd.length >= maxCount) break;
             }
 
-            const now = Date.now();
-            if (now - lastProgressUpdate > 100 || allMessages.length >= maxCount) {
-                const elapsedSec = Math.max(0.1, (now - startTime) / 1000);
-                const rate = Math.round(allMessages.length / elapsedSec);
-
-                let fraction = 0;
-                if (maxCount !== Infinity && maxCount > 0) {
-                    fraction = Math.min(1, allMessages.length / maxCount);
-                } else if (alphaTimestamp !== null && omegaTimestamp !== null && omegaTimestamp > alphaTimestamp) {
-                    const currentMsgTimestamp = new Date(messages[messages.length - 1].timestamp).getTime();
-                    const totalSpan = Math.abs(omegaTimestamp - alphaTimestamp);
-                    const currentSpan = Math.abs(currentMsgTimestamp - alphaTimestamp);
-                    fraction = Math.min(1, Math.max(0, currentSpan / totalSpan));
-                }
-
-                const percent = Math.round(fraction * 100);
-                let etaText = "Estimating...";
-                if (fraction > 0.02 && fraction < 1) {
-                    const totalEstimatedSec = elapsedSec / fraction;
-                    const remainingSec = Math.max(0, totalEstimatedSec - elapsedSec);
-                    etaText = `~${formatDuration(remainingSec)}`;
-                } else if (fraction >= 1) {
-                    etaText = "Finishing...";
-                }
-
-                onProgress({
-                    count: allMessages.length,
-                    rate,
-                    percentage: percent,
-                    etaText
-                });
-                lastProgressUpdate = now;
+            if (batchToAdd.length > 0) {
+                allMessages.push(...batchToAdd);
+                onBatch?.(batchToAdd);
             }
 
-            if (!hasMore || !pendingFetch) break;
+            if (reachedBoundary || !hasMore || !pendingFetch || allMessages.length >= maxCount) break;
 
             currentBoundary = nextBoundary;
 
@@ -1217,41 +1189,92 @@ async function exportChannelStreaming(
             throw new Error("No forum posts or threads found in this channel.");
         }
 
+        const CONCURRENCY = options.respectRateLimits === false ? 6 : 4;
+        let totalMessagesExported = 0;
+        let completedThreadsCount = 0;
+        const startTime = Date.now();
+        let lastProgressUpdate = 0;
+
+        const updateProgress = (activeThreadName?: string) => {
+            const now = Date.now();
+            if (now - lastProgressUpdate < 75 && completedThreadsCount < threads.length) return;
+            lastProgressUpdate = now;
+
+            const elapsedSec = Math.max(0.1, (now - startTime) / 1000);
+            const rate = Math.round(totalMessagesExported / elapsedSec);
+            const fraction = Math.min(1, Math.max(0, completedThreadsCount / threads.length));
+            const percentage = Math.round(fraction * 100);
+
+            let etaText = "Estimating...";
+            if (fraction > 0.02 && fraction < 1) {
+                const totalEstimatedSec = elapsedSec / fraction;
+                const remainingSec = Math.max(0, totalEstimatedSec - elapsedSec);
+                etaText = `~${formatDuration(remainingSec)}`;
+            } else if (fraction >= 1) {
+                etaText = "Finishing...";
+            }
+
+            onProgress({
+                count: totalMessagesExported,
+                rate,
+                percentage,
+                etaText,
+                subStatus: activeThreadName
+                    ? `[${completedThreadsCount}/${threads.length} posts] #${activeThreadName}`
+                    : `[${completedThreadsCount}/${threads.length} posts]`
+            });
+        };
+
         // Multi-file ZIP Bundle Mode
         if (options.format === "HtmlZip") {
             const zipFiles: Record<string, Uint8Array> = {};
-            const indexRows: string[] = [];
+            const indexRows: string[] = new Array(threads.length);
+            let currentIndex = 0;
 
-            for (let tIdx = 0; tIdx < threads.length; tIdx++) {
-                if (abortSignal.aborted) throw { isCanceled: true };
-                const thread = threads[tIdx];
-                const threadName = getChannelDisplayName(thread);
-                const safeThreadName = threadName.replace(/[^a-z0-9_-]/gi, "_").toLowerCase();
+            const runZipWorker = async () => {
+                while (currentIndex < threads.length) {
+                    if (abortSignal.aborted) throw { isCanceled: true };
+                    const index = currentIndex++;
+                    const thread = threads[index];
+                    const threadName = getChannelDisplayName(thread);
+                    const safeThreadName = threadName.replace(/[^a-z0-9_-]/gi, "_").toLowerCase();
 
-                onProgress({
-                    count: totalMessagesExported,
-                    rate: 0,
-                    percentage: Math.round((tIdx / threads.length) * 100),
-                    etaText: `Post ${tIdx + 1}/${threads.length}`,
-                    subStatus: `#${threadName}`
-                });
+                    updateProgress(threadName);
 
-                const messages = await fetchMessagesFast(thread.id, options, abortSignal, () => {});
-                totalMessagesExported += messages.length;
+                    const messages = await fetchMessagesFast(
+                        thread.id,
+                        options,
+                        abortSignal,
+                        (batch) => {
+                            totalMessagesExported += batch.length;
+                            updateProgress(threadName);
+                        }
+                    );
 
-                const groups = groupMessages(messages);
-                const postHtml = renderHtmlHeader(threadName, thread.id, isDark) +
-                    groups.map(g => renderHtmlMessageGroup(g, isDark)).join("\n") +
-                    renderHtmlFooter(messages.length);
+                    completedThreadsCount++;
+                    updateProgress(threadName);
 
-                zipFiles[`posts/${thread.id}_${safeThreadName}.html`] = strToU8(postHtml);
-                indexRows.push(`
-                <tr>
-                    <td><a href="posts/${thread.id}_${safeThreadName}.html">${sanitizeHtml(threadName)}</a></td>
-                    <td>${messages.length.toLocaleString()}</td>
-                    <td>${new Date(thread.thread_metadata?.create_timestamp || thread.id).toLocaleDateString()}</td>
-                </tr>`);
+                    const groups = groupMessages(messages);
+                    const postHtml = renderHtmlHeader(threadName, thread.id, isDark) +
+                        groups.map(g => renderHtmlMessageGroup(g, isDark)).join("\n") +
+                        renderHtmlFooter(messages.length);
+
+                    zipFiles[`posts/${thread.id}_${safeThreadName}.html`] = strToU8(postHtml);
+                    indexRows[index] = `
+                    <tr>
+                        <td><a href="posts/${thread.id}_${safeThreadName}.html">${sanitizeHtml(threadName)}</a></td>
+                        <td>${messages.length.toLocaleString()}</td>
+                        <td>${new Date(thread.thread_metadata?.create_timestamp || thread.id).toLocaleDateString()}</td>
+                    </tr>`;
+                }
+            };
+
+            const workers: Promise<void>[] = [];
+            const numWorkers = Math.min(CONCURRENCY, threads.length);
+            for (let w = 0; w < numWorkers; w++) {
+                workers.push(runZipWorker());
             }
+            await Promise.all(workers);
 
             const indexCatalogHtml = `<!DOCTYPE html>
 <html><head><title>${sanitizeHtml(channelName)} - Forum Catalog</title>
@@ -1297,76 +1320,115 @@ a:hover { text-decoration: underline; }
             await writer.write(`====================================================\nFORUM: #${channelName} (${channel.id})\nTotal Posts: ${threads.length}\n====================================================\n\n`);
         }
 
-        for (let tIdx = 0; tIdx < threads.length; tIdx++) {
-            if (abortSignal.aborted) throw { isCanceled: true };
-            const thread = threads[tIdx];
-            const threadName = getChannelDisplayName(thread);
+        const pendingResults = new Map<number, Message[]>();
+        let writePointer = 0;
+        let isFlushing = false;
 
-            onProgress({
-                count: totalMessagesExported,
-                rate: 0,
-                percentage: Math.round((tIdx / threads.length) * 100),
-                etaText: `Post ${tIdx + 1}/${threads.length}`,
-                subStatus: `#${threadName}`
-            });
+        const flushToWriter = async () => {
+            if (isFlushing) return;
+            isFlushing = true;
+            try {
+                while (pendingResults.has(writePointer)) {
+                    const messages = pendingResults.get(writePointer)!;
+                    pendingResults.delete(writePointer);
+                    const thread = threads[writePointer];
+                    const threadName = getChannelDisplayName(thread);
 
-            if (options.format === "HtmlDark" || options.format === "HtmlLight") {
-                await writer.write(`
-                <div id="post-${thread.id}" class="chatlog__forum-post-header">
-                    <h2 class="chatlog__forum-post-title">📌 ${sanitizeHtml(threadName)}</h2>
-                    <div class="chatlog__forum-post-meta">Post ID: ${thread.id} • ${new Date(thread.thread_metadata?.create_timestamp || thread.id).toLocaleDateString()}</div>
-                </div>`);
-            } else if (options.format === "PlainText") {
-                await writer.write(`\n====================================================\nPOST [${tIdx + 1}/${threads.length}]: ${threadName} (${thread.id})\n====================================================\n\n`);
-            }
-
-            const messages = await fetchMessagesFast(thread.id, options, abortSignal, () => {});
-
-            if (options.format === "HtmlDark" || options.format === "HtmlLight") {
-                const groups = groupMessages(messages);
-                const chunkHtml = groups.map(g => renderHtmlMessageGroup(g, isDark)).join("\n");
-                await writer.write(chunkHtml);
-            } else if (options.format === "Json") {
-                const postObj = {
-                    id: thread.id,
-                    title: threadName,
-                    messageCount: messages.length,
-                    messages
-                };
-                await writer.write((tIdx === 0 ? "" : ",\n") + `    ${JSON.stringify(postObj, null, 2)}`);
-            } else if (options.format === "Csv") {
-                const csvRows = messages.map(msg => {
-                    const forumId = `"${channel.id}"`;
-                    const forumName = `"${channelName.replace(/"/g, '""')}"`;
-                    const postId = `"${thread.id}"`;
-                    const postTitle = `"${threadName.replace(/"/g, '""')}"`;
-                    const msgId = `"${msg.id || ""}"`;
-                    const authorId = `"${msg.author?.id || ""}"`;
-                    const author = `"${(msg.author?.global_name || msg.author?.username || "").replace(/"/g, '""')}"`;
-                    const date = `"${new Date(msg.timestamp).toISOString()}"`;
-                    const content = `"${(msg.content || "").replace(/"/g, '""')}"`;
-                    const attachments = `"${(msg.attachments?.map((a: any) => a.url) || []).join(" ")}"`;
-                    const reactions = `"${(msg.reactions?.map((r: any) => `${r.emoji.name}:${r.count}`) || []).join(" ")}"`;
-                    const stickers = `"${(msg.sticker_items?.map((s: any) => s.name) || []).join(" ")}"`;
-                    const replyTo = `"${msg.referenced_message?.id || ""}"`;
-                    return [forumId, forumName, postId, postTitle, msgId, authorId, author, date, content, attachments, reactions, stickers, replyTo].join(",");
-                }).join("\n") + "\n";
-                await writer.write(csvRows);
-            } else if (options.format === "PlainText") {
-                const textRows = messages.map(msg => {
-                    const author = msg.author?.global_name || msg.author?.username || "Unknown";
-                    const date = new Date(msg.timestamp).toISOString().replace("T", " ").substring(0, 19);
-                    let text = `[${date}] ${author}: ${msg.content || ""}`;
-                    if (msg.attachments?.length) {
-                        text += `\n  [Attachments: ${msg.attachments.map((a: any) => a.url).join(", ")}]`;
+                    if (options.format === "HtmlDark" || options.format === "HtmlLight") {
+                        await writer.write(`
+                        <div id="post-${thread.id}" class="chatlog__forum-post-header">
+                            <h2 class="chatlog__forum-post-title">📌 ${sanitizeHtml(threadName)}</h2>
+                            <div class="chatlog__forum-post-meta">Post ID: ${thread.id} • ${new Date(thread.thread_metadata?.create_timestamp || thread.id).toLocaleDateString()}</div>
+                        </div>`);
+                        const groups = groupMessages(messages);
+                        const chunkHtml = groups.map(g => renderHtmlMessageGroup(g, isDark)).join("\n");
+                        await writer.write(chunkHtml);
+                    } else if (options.format === "Json") {
+                        const postObj = {
+                            id: thread.id,
+                            title: threadName,
+                            messageCount: messages.length,
+                            messages
+                        };
+                        await writer.write((writePointer === 0 ? "" : ",\n") + `    ${JSON.stringify(postObj, null, 2)}`);
+                    } else if (options.format === "Csv") {
+                        const csvRows = messages.map(msg => {
+                            const forumId = `"${channel.id}"`;
+                            const forumName = `"${channelName.replace(/"/g, '""')}"`;
+                            const postId = `"${thread.id}"`;
+                            const postTitle = `"${threadName.replace(/"/g, '""')}"`;
+                            const msgId = `"${msg.id || ""}"`;
+                            const authorId = `"${msg.author?.id || ""}"`;
+                            const author = `"${(msg.author?.global_name || msg.author?.username || "").replace(/"/g, '""')}"`;
+                            const date = `"${new Date(msg.timestamp).toISOString()}"`;
+                            const content = `"${(msg.content || "").replace(/"/g, '""')}"`;
+                            const attachments = `"${(msg.attachments?.map((a: any) => a.url) || []).join(" ")}"`;
+                            const reactions = `"${(msg.reactions?.map((r: any) => `${r.emoji.name}:${r.count}`) || []).join(" ")}"`;
+                            const stickers = `"${(msg.sticker_items?.map((s: any) => s.name) || []).join(" ")}"`;
+                            const replyTo = `"${msg.referenced_message?.id || ""}"`;
+                            return [forumId, forumName, postId, postTitle, msgId, authorId, author, date, content, attachments, reactions, stickers, replyTo].join(",");
+                        }).join("\n") + (messages.length > 0 ? "\n" : "");
+                        await writer.write(csvRows);
+                    } else if (options.format === "PlainText") {
+                        await writer.write(`\n====================================================\nPOST [${writePointer + 1}/${threads.length}]: ${threadName} (${thread.id})\n====================================================\n\n`);
+                        const textRows = messages.map(msg => {
+                            const author = msg.author?.global_name || msg.author?.username || "Unknown";
+                            const date = new Date(msg.timestamp).toISOString().replace("T", " ").substring(0, 19);
+                            let text = `[${date}] ${author}: ${msg.content || ""}`;
+                            if (msg.attachments?.length) {
+                                text += `\n  [Attachments: ${msg.attachments.map((a: any) => a.url).join(", ")}]`;
+                            }
+                            return text;
+                        }).join("\n") + (messages.length > 0 ? "\n" : "");
+                        await writer.write(textRows);
                     }
-                    return text;
-                }).join("\n") + "\n";
-                await writer.write(textRows);
-            }
 
-            totalMessagesExported += messages.length;
+                    writePointer++;
+                }
+            } finally {
+                isFlushing = false;
+                if (pendingResults.has(writePointer)) {
+                    await flushToWriter();
+                }
+            }
+        };
+
+        let currentIndex = 0;
+        const runCatalogWorker = async () => {
+            while (currentIndex < threads.length) {
+                if (abortSignal.aborted) throw { isCanceled: true };
+                const index = currentIndex++;
+                const thread = threads[index];
+                const threadName = getChannelDisplayName(thread);
+
+                updateProgress(threadName);
+
+                const messages = await fetchMessagesFast(
+                    thread.id,
+                    options,
+                    abortSignal,
+                    (batch) => {
+                        totalMessagesExported += batch.length;
+                        updateProgress(threadName);
+                    }
+                );
+
+                completedThreadsCount++;
+                updateProgress(threadName);
+
+                pendingResults.set(index, messages);
+                await flushToWriter();
+            }
+        };
+
+        const workers: Promise<void>[] = [];
+        const numWorkers = Math.min(CONCURRENCY, threads.length);
+        for (let w = 0; w < numWorkers; w++) {
+            workers.push(runCatalogWorker());
         }
+        await Promise.all(workers);
+
+        await flushToWriter();
 
         if (options.format === "HtmlDark" || options.format === "HtmlLight") {
             await writer.write(renderHtmlFooter(totalMessagesExported));
@@ -1706,6 +1768,18 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                         <span>Progress: <b>{progress.percentage}%</b></span>
                         <span>Estimated Time: <b>{progress.etaText}</b></span>
                     </div>
+                    {progress.subStatus && (
+                        <div style={{
+                            marginTop: "6px",
+                            fontSize: "12px",
+                            color: "var(--text-muted, #949ba4)",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap"
+                        }}>
+                            {progress.subStatus}
+                        </div>
+                    )}
                 </div>
             ) : (
                 <div className="vc-ce-modal">
