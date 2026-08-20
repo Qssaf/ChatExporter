@@ -14,6 +14,7 @@ import { Paragraph } from "@components/Paragraph";
 import definePlugin from "@utils/types";
 import { Channel, Message, RenderModalProps } from "@vencord/discord-types";
 import { AuthenticationStore, ChannelStore, Constants, createRoot, Menu, Modal, openModal, RestAPI, Toasts, useEffect, useState } from "@webpack/common";
+import { strToU8, zipSync } from "fflate";
 
 const DISCORD_EPOCH = 1420070400000n;
 
@@ -50,8 +51,20 @@ function getChannelDisplayName(channel: Channel): string {
     return `channel-${channel.id}`;
 }
 
-function downloadFile(content: string, filename: string, mimeType: string) {
-    const blob = new Blob([content], { type: mimeType });
+function isForumChannel(channel: Channel): boolean {
+    if (!channel) return false;
+    const c = channel as any;
+    return (
+        channel.type === 15 ||
+        channel.type === 16 ||
+        c.isForumLikeChannel?.() === true ||
+        c.isForumChannel?.() === true ||
+        c.isMediaChannel?.() === true
+    );
+}
+
+function downloadFile(content: string | Uint8Array, filename: string, mimeType: string) {
+    const blob = new Blob([content as any], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -62,13 +75,14 @@ function downloadFile(content: string, filename: string, mimeType: string) {
     setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
-export type ExportFormat = "HtmlDark" | "HtmlLight" | "Json" | "Csv" | "PlainText";
+export type ExportFormat = "HtmlDark" | "HtmlLight" | "HtmlZip" | "Json" | "Csv" | "PlainText";
 
 export interface ExportProgress {
     count: number;
     rate: number;
     percentage: number;
     etaText: string;
+    subStatus?: string;
 }
 
 interface ExportOptions {
@@ -77,6 +91,7 @@ interface ExportOptions {
     beforeDate?: string;
     maxMessages?: number;
     includeBotMessages: boolean;
+    includeArchivedThreads?: boolean;
     reverseOrder?: boolean;
     respectRateLimits?: boolean;
 }
@@ -95,10 +110,10 @@ interface StreamWriter {
 }
 
 async function createStreamWriter(suggestedFilename: string, format: ExportFormat): Promise<StreamWriter> {
-    const ext = format === "Json" ? "json" : format === "Csv" ? "csv" : format === "PlainText" ? "txt" : "html";
-    const mime = format === "Json" ? "application/json" : format === "Csv" ? "text/csv" : format === "PlainText" ? "text/plain" : "text/html";
+    const ext = format === "Json" ? "json" : format === "Csv" ? "csv" : format === "PlainText" ? "txt" : format === "HtmlZip" ? "zip" : "html";
+    const mime = format === "Json" ? "application/json" : format === "Csv" ? "text/csv" : format === "PlainText" ? "text/plain" : format === "HtmlZip" ? "application/zip" : "text/html";
 
-    if (typeof (window as any).showSaveFilePicker === "function") {
+    if (format !== "HtmlZip" && typeof (window as any).showSaveFilePicker === "function") {
         try {
             const handle = await (window as any).showSaveFilePicker({
                 suggestedName: suggestedFilename,
@@ -192,6 +207,11 @@ export function ActiveExportsDock() {
                         <span><b>{task.progress.count.toLocaleString()}</b> msgs ({task.progress.rate}/s)</span>
                         <span>{task.progress.percentage}% • {task.progress.etaText}</span>
                     </div>
+                    {task.progress.subStatus && (
+                        <div style={{ fontSize: "11px", opacity: 0.7, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {task.progress.subStatus}
+                        </div>
+                    )}
                 </div>
             ))}
         </div>
@@ -253,10 +273,10 @@ function groupMessages(messages: any[]): MessageGroup[] {
     return groups;
 }
 
-async function fetchBatch(channelId: string, query: Record<string, any>, signal?: AbortSignal) {
+async function fetchBatch(channelId: string, query: Record<string, any>, signal?: AbortSignal, customUrl?: string) {
     const token = AuthenticationStore?.getToken?.();
     const queryString = new URLSearchParams(query).toString();
-    const url = `https://discord.com/api/v10/channels/${channelId}/messages?${queryString}`;
+    const url = customUrl || `https://discord.com/api/v10/channels/${channelId}/messages?${queryString}`;
 
     if (token) {
         const response = await fetch(url, {
@@ -298,6 +318,197 @@ async function fetchBatch(channelId: string, query: Record<string, any>, signal?
         query,
         retries: 3
     });
+}
+
+async function fetchForumThreads(channelId: string, includeArchived: boolean, signal: AbortSignal): Promise<Channel[]> {
+    const threads: Channel[] = [];
+
+    try {
+        const activeRes = await fetchBatch(channelId, {}, signal, `https://discord.com/api/v10/channels/${channelId}/threads/active`);
+        if (activeRes?.body?.threads) {
+            threads.push(...activeRes.body.threads);
+        }
+    } catch (e) {
+        console.warn("[ChatExporter] Error fetching active threads:", e);
+    }
+
+    if (includeArchived) {
+        let beforeTimestamp: string | undefined = undefined;
+        let hasMore = true;
+
+        while (hasMore) {
+            if (signal.aborted) throw { isCanceled: true };
+            try {
+                const query: Record<string, any> = { limit: 100 };
+                if (beforeTimestamp) query.before = beforeTimestamp;
+
+                const queryString = new URLSearchParams(query).toString();
+                const url = `https://discord.com/api/v10/channels/${channelId}/threads/archived/public?${queryString}`;
+                const archivedRes = await fetchBatch(channelId, query, signal, url);
+
+                const batch = archivedRes?.body?.threads ?? [];
+                if (batch.length === 0) break;
+
+                threads.push(...batch);
+                hasMore = Boolean(archivedRes?.body?.has_more && batch.length >= 100);
+                if (hasMore) {
+                    beforeTimestamp = batch[batch.length - 1].thread_metadata?.archive_timestamp;
+                }
+            } catch (e) {
+                console.warn("[ChatExporter] Error fetching archived threads:", e);
+                break;
+            }
+        }
+    }
+
+    return threads;
+}
+
+async function fetchMessagesFast(
+    channelId: string,
+    options: ExportOptions,
+    abortSignal: AbortSignal,
+    onProgress: (progress: ExportProgress) => void
+): Promise<Message[]> {
+    const allMessages: any[] = [];
+    const beforeSnowflake = options.beforeDate ? dateToSnowflake(new Date(options.beforeDate)) : undefined;
+    const afterSnowflake = options.afterDate ? dateToSnowflake(new Date(options.afterDate)) : undefined;
+    const maxCount = options.maxMessages && options.maxMessages > 0 ? options.maxMessages : Infinity;
+    const isReverse = Boolean(options.reverseOrder);
+    const respectRateLimits = options.respectRateLimits !== false;
+
+    if (abortSignal.aborted) throw { isCanceled: true };
+
+    let omegaTimestamp: number | null = null;
+    try {
+        const omegaRes = await fetchBatch(channelId, { limit: 1, ...(beforeSnowflake ? { before: beforeSnowflake } : {}) }, abortSignal);
+        if (omegaRes?.body?.[0]?.timestamp) {
+            omegaTimestamp = new Date(omegaRes.body[0].timestamp).getTime();
+        }
+    } catch (e: any) {
+        if (abortSignal.aborted || e?.name === "AbortError") throw { isCanceled: true };
+    }
+
+    let alphaTimestamp: number | null = null;
+    let currentBoundary = !isReverse ? (afterSnowflake ?? "0") : beforeSnowflake;
+    const startTime = Date.now();
+    let lastProgressUpdate = 0;
+
+    const buildQuery = (boundary: string | undefined, countNeeded: number) => {
+        const query: Record<string, any> = { limit: Math.min(100, countNeeded) };
+        if (!isReverse) {
+            query.after = boundary;
+        } else if (boundary) {
+            query.before = boundary;
+        }
+        return query;
+    };
+
+    let pendingFetch: Promise<any> | null = fetchBatch(channelId, buildQuery(currentBoundary, maxCount - allMessages.length), abortSignal);
+
+    while (allMessages.length < maxCount) {
+        if (abortSignal.aborted || !pendingFetch) throw { isCanceled: true };
+
+        try {
+            const res = await pendingFetch;
+            if (abortSignal.aborted) throw { isCanceled: true };
+
+            let messages: any[] = res?.body ?? [];
+            if (!messages || messages.length === 0) break;
+
+            if (!isReverse) {
+                messages.sort((a, b) => (BigInt(a.id) > BigInt(b.id) ? 1 : -1));
+            } else {
+                messages.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? 1 : -1));
+            }
+
+            if (alphaTimestamp === null && messages.length > 0) {
+                alphaTimestamp = new Date(messages[0].timestamp).getTime();
+            }
+
+            const nextBoundary = messages[messages.length - 1].id;
+            const countAfterThis = allMessages.length + messages.length;
+            const hasMore = messages.length === 100 && countAfterThis < maxCount;
+
+            if (hasMore && !abortSignal.aborted) {
+                pendingFetch = fetchBatch(channelId, buildQuery(nextBoundary, maxCount - countAfterThis), abortSignal);
+            } else {
+                pendingFetch = null;
+            }
+
+            for (const msg of messages) {
+                if (!isReverse && beforeSnowflake && BigInt(msg.id) >= BigInt(beforeSnowflake)) {
+                    return allMessages;
+                }
+                if (isReverse && afterSnowflake && BigInt(msg.id) <= BigInt(afterSnowflake)) {
+                    return allMessages;
+                }
+
+                if (!options.includeBotMessages && msg.author?.bot) continue;
+                allMessages.push(msg);
+                if (allMessages.length >= maxCount) break;
+            }
+
+            const now = Date.now();
+            if (now - lastProgressUpdate > 100 || allMessages.length >= maxCount) {
+                const elapsedSec = Math.max(0.1, (now - startTime) / 1000);
+                const rate = Math.round(allMessages.length / elapsedSec);
+
+                let fraction = 0;
+                if (maxCount !== Infinity && maxCount > 0) {
+                    fraction = Math.min(1, allMessages.length / maxCount);
+                } else if (alphaTimestamp !== null && omegaTimestamp !== null && omegaTimestamp > alphaTimestamp) {
+                    const currentMsgTimestamp = new Date(messages[messages.length - 1].timestamp).getTime();
+                    const totalSpan = Math.abs(omegaTimestamp - alphaTimestamp);
+                    const currentSpan = Math.abs(currentMsgTimestamp - alphaTimestamp);
+                    fraction = Math.min(1, Math.max(0, currentSpan / totalSpan));
+                }
+
+                const percent = Math.round(fraction * 100);
+                let etaText = "Estimating...";
+                if (fraction > 0.02 && fraction < 1) {
+                    const totalEstimatedSec = elapsedSec / fraction;
+                    const remainingSec = Math.max(0, totalEstimatedSec - elapsedSec);
+                    etaText = `~${formatDuration(remainingSec)}`;
+                } else if (fraction >= 1) {
+                    etaText = "Finishing...";
+                }
+
+                onProgress({
+                    count: allMessages.length,
+                    rate,
+                    percentage: percent,
+                    etaText
+                });
+                lastProgressUpdate = now;
+            }
+
+            if (!hasMore || !pendingFetch) break;
+
+            currentBoundary = nextBoundary;
+
+            if (respectRateLimits) {
+                const remaining = Number(res?.headers?.["x-ratelimit-remaining"] ?? 5);
+                const resetAfter = Number(res?.headers?.["x-ratelimit-reset-after"] ?? 0);
+                if (remaining === 0 && resetAfter > 0) {
+                    await new Promise(r => setTimeout(r, resetAfter * 1000 + 20));
+                }
+            }
+        } catch (err: any) {
+            if (abortSignal.aborted || err?.isCanceled || err?.name === "AbortError") {
+                throw { isCanceled: true };
+            }
+            if (err?.status === 429) {
+                const retryAfter = (err?.body?.retry_after ?? 1.2) * 1000;
+                await new Promise(r => setTimeout(r, retryAfter + 50));
+                pendingFetch = fetchBatch(channelId, buildQuery(currentBoundary, maxCount - allMessages.length), abortSignal);
+                continue;
+            }
+            throw err;
+        }
+    }
+
+    return isReverse ? allMessages.reverse() : allMessages;
 }
 
 function formatMarkdown(text: string): string {
@@ -660,6 +871,43 @@ function renderHtmlHeader(channelName: string, channelId: string, isDark: boolea
             width: 1rem;
             height: 1rem;
         }
+        .chatlog__forum-index {
+            padding: 1.25rem;
+            background-color: ${embedBg};
+            border-bottom: 1px solid ${borderCol};
+            margin-bottom: 1rem;
+        }
+        .chatlog__forum-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+        }
+        .chatlog__forum-table th {
+            text-align: left;
+            padding: 8px;
+            border-bottom: 2px solid ${borderCol};
+            color: ${authorColor};
+        }
+        .chatlog__forum-table td {
+            padding: 8px;
+            border-bottom: 1px solid ${borderCol};
+        }
+        .chatlog__forum-post-header {
+            padding: 12px 16px;
+            background: ${embedBg};
+            border-left: 4px solid #5865f2;
+            border-radius: 4px;
+            margin: 1.5rem 1rem 1rem 1rem;
+        }
+        .chatlog__forum-post-title {
+            margin: 0 0 6px 0;
+            font-size: 1.25rem;
+            color: ${authorColor};
+        }
+        .chatlog__forum-post-meta {
+            font-size: 0.85rem;
+            color: ${subText};
+        }
         .postamble {
             padding: 1.25rem;
             border-top: 1px solid ${borderCol};
@@ -699,7 +947,6 @@ function renderHtmlMessageGroup(group: MessageGroup, isDark: boolean): string {
     const embedBorder = isDark ? "rgba(46, 48, 54, 0.6)" : "rgba(204, 204, 204, 0.3)";
     const borderCol = isDark ? "rgba(255, 255, 255, 0.1)" : "#eceeef";
     const reactionBg = isDark ? "#2f3136" : "#f2f3f5";
-    const fg = isDark ? "#dcddde" : "#23262a";
 
     const messagesHtml = group.messages.map((msg, i) => {
         const isFirst = i === 0;
@@ -911,23 +1158,14 @@ async function exportChannelStreaming(
     abortSignal: AbortSignal,
     onProgress: (progress: ExportProgress) => void
 ): Promise<number> {
+    const isForum = isForumChannel(channel);
     const channelName = getChannelDisplayName(channel);
     const isDark = options.format !== "HtmlLight";
     const FLUSH_THRESHOLD = 20000;
+
     let totalMessagesExported = 0;
     let isFirstBatch = true;
     let writeBuffer: any[] = [];
-
-    // 1. Write Header
-    if (options.format === "HtmlDark" || options.format === "HtmlLight") {
-        await writer.write(renderHtmlHeader(channelName, channel.id, isDark));
-    } else if (options.format === "Json") {
-        await writer.write(`{\n  "channel": ${JSON.stringify({ id: channel.id, name: channelName })},\n  "messages": [\n`);
-    } else if (options.format === "Csv") {
-        await writer.write("MessageID,AuthorID,Author,Date,Content,Attachments,Reactions,Stickers,ReplyTo\n");
-    } else if (options.format === "PlainText") {
-        await writer.write(`====================================================\nChannel: ${channelName} (${channel.id})\nExport Date: ${new Date().toLocaleString()}\n====================================================\n\n`);
-    }
 
     const flushDiskBuffer = async () => {
         if (writeBuffer.length === 0) return;
@@ -969,6 +1207,186 @@ async function exportChannelStreaming(
         isFirstBatch = false;
         writeBuffer = [];
     };
+
+    // Forum Multi-Thread Exporting
+    if (isForum) {
+        onProgress({ count: 0, rate: 0, percentage: 0, etaText: "Discovering forum posts..." });
+        const threads = await fetchForumThreads(channel.id, options.includeArchivedThreads !== false, abortSignal);
+
+        if (threads.length === 0) {
+            throw new Error("No forum posts or threads found in this channel.");
+        }
+
+        // Multi-file ZIP Bundle Mode
+        if (options.format === "HtmlZip") {
+            const zipFiles: Record<string, Uint8Array> = {};
+            const indexRows: string[] = [];
+
+            for (let tIdx = 0; tIdx < threads.length; tIdx++) {
+                if (abortSignal.aborted) throw { isCanceled: true };
+                const thread = threads[tIdx];
+                const threadName = getChannelDisplayName(thread);
+                const safeThreadName = threadName.replace(/[^a-z0-9_-]/gi, "_").toLowerCase();
+
+                onProgress({
+                    count: totalMessagesExported,
+                    rate: 0,
+                    percentage: Math.round((tIdx / threads.length) * 100),
+                    etaText: `Post ${tIdx + 1}/${threads.length}`,
+                    subStatus: `#${threadName}`
+                });
+
+                const messages = await fetchMessagesFast(thread.id, options, abortSignal, () => {});
+                totalMessagesExported += messages.length;
+
+                const groups = groupMessages(messages);
+                const postHtml = renderHtmlHeader(threadName, thread.id, isDark) +
+                    groups.map(g => renderHtmlMessageGroup(g, isDark)).join("\n") +
+                    renderHtmlFooter(messages.length);
+
+                zipFiles[`posts/${thread.id}_${safeThreadName}.html`] = strToU8(postHtml);
+                indexRows.push(`
+                <tr>
+                    <td><a href="posts/${thread.id}_${safeThreadName}.html">${sanitizeHtml(threadName)}</a></td>
+                    <td>${messages.length.toLocaleString()}</td>
+                    <td>${new Date(thread.thread_metadata?.create_timestamp || thread.id).toLocaleDateString()}</td>
+                </tr>`);
+            }
+
+            const indexCatalogHtml = `<!DOCTYPE html>
+<html><head><title>${sanitizeHtml(channelName)} - Forum Catalog</title>
+<style>
+body { background-color: ${isDark ? "#36393e" : "#fff"}; color: ${isDark ? "#dcddde" : "#23262a"}; font-family: "gg sans", sans-serif; padding: 24px; }
+table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+th, td { text-align: left; padding: 10px; border-bottom: 1px solid ${isDark ? "rgba(255,255,255,0.1)" : "#eee"}; }
+a { color: #00aff4; text-decoration: none; font-weight: 600; }
+a:hover { text-decoration: underline; }
+</style>
+</head><body>
+<h1>#${sanitizeHtml(channelName)} - Forum Catalog</h1>
+<p>Total Posts: ${threads.length} | Total Messages: ${totalMessagesExported.toLocaleString()}</p>
+<table><thead><tr><th>Post Title</th><th>Messages</th><th>Date</th></tr></thead><tbody>${indexRows.join("\n")}</tbody></table>
+</body></html>`;
+
+            zipFiles["index.html"] = strToU8(indexCatalogHtml);
+            const zipped = zipSync(zipFiles);
+            downloadFile(zipped, `${channelName.replace(/[^a-z0-9_-]/gi, "_").toLowerCase()}_forum.zip`, "application/zip");
+            return totalMessagesExported;
+        }
+
+        // Single Master Catalog Format (HTML, JSON, CSV, TXT)
+        if (options.format === "HtmlDark" || options.format === "HtmlLight") {
+            let indexRows = `
+            <div class="chatlog__forum-index">
+                <h3 style="margin-top: 0; color: ${isDark ? '#fff' : '#000'};">Forum Posts (${threads.length})</h3>
+                <table class="chatlog__forum-table">
+                    <thead><tr><th>Post Title</th><th>Date</th></tr></thead>
+                    <tbody>`;
+
+            for (const thread of threads) {
+                indexRows += `<tr><td><a href="#post-${thread.id}">${sanitizeHtml(getChannelDisplayName(thread))}</a></td><td>${new Date(thread.thread_metadata?.create_timestamp || thread.id).toLocaleDateString()}</td></tr>`;
+            }
+            indexRows += `</tbody></table></div>`;
+
+            await writer.write(renderHtmlHeader(channelName, channel.id, isDark) + indexRows);
+        } else if (options.format === "Json") {
+            await writer.write(`{\n  "forum": ${JSON.stringify({ id: channel.id, name: channelName, totalPosts: threads.length })},\n  "posts": [\n`);
+        } else if (options.format === "Csv") {
+            await writer.write("ForumID,ForumName,PostID,PostTitle,MessageID,AuthorID,Author,Date,Content,Attachments,Reactions,Stickers,ReplyTo\n");
+        } else if (options.format === "PlainText") {
+            await writer.write(`====================================================\nFORUM: #${channelName} (${channel.id})\nTotal Posts: ${threads.length}\n====================================================\n\n`);
+        }
+
+        for (let tIdx = 0; tIdx < threads.length; tIdx++) {
+            if (abortSignal.aborted) throw { isCanceled: true };
+            const thread = threads[tIdx];
+            const threadName = getChannelDisplayName(thread);
+
+            onProgress({
+                count: totalMessagesExported,
+                rate: 0,
+                percentage: Math.round((tIdx / threads.length) * 100),
+                etaText: `Post ${tIdx + 1}/${threads.length}`,
+                subStatus: `#${threadName}`
+            });
+
+            if (options.format === "HtmlDark" || options.format === "HtmlLight") {
+                await writer.write(`
+                <div id="post-${thread.id}" class="chatlog__forum-post-header">
+                    <h2 class="chatlog__forum-post-title">📌 ${sanitizeHtml(threadName)}</h2>
+                    <div class="chatlog__forum-post-meta">Post ID: ${thread.id} • ${new Date(thread.thread_metadata?.create_timestamp || thread.id).toLocaleDateString()}</div>
+                </div>`);
+            } else if (options.format === "PlainText") {
+                await writer.write(`\n====================================================\nPOST [${tIdx + 1}/${threads.length}]: ${threadName} (${thread.id})\n====================================================\n\n`);
+            }
+
+            const messages = await fetchMessagesFast(thread.id, options, abortSignal, () => {});
+
+            if (options.format === "HtmlDark" || options.format === "HtmlLight") {
+                const groups = groupMessages(messages);
+                const chunkHtml = groups.map(g => renderHtmlMessageGroup(g, isDark)).join("\n");
+                await writer.write(chunkHtml);
+            } else if (options.format === "Json") {
+                const postObj = {
+                    id: thread.id,
+                    title: threadName,
+                    messageCount: messages.length,
+                    messages
+                };
+                await writer.write((tIdx === 0 ? "" : ",\n") + `    ${JSON.stringify(postObj, null, 2)}`);
+            } else if (options.format === "Csv") {
+                const csvRows = messages.map(msg => {
+                    const forumId = `"${channel.id}"`;
+                    const forumName = `"${channelName.replace(/"/g, '""')}"`;
+                    const postId = `"${thread.id}"`;
+                    const postTitle = `"${threadName.replace(/"/g, '""')}"`;
+                    const msgId = `"${msg.id || ""}"`;
+                    const authorId = `"${msg.author?.id || ""}"`;
+                    const author = `"${(msg.author?.global_name || msg.author?.username || "").replace(/"/g, '""')}"`;
+                    const date = `"${new Date(msg.timestamp).toISOString()}"`;
+                    const content = `"${(msg.content || "").replace(/"/g, '""')}"`;
+                    const attachments = `"${(msg.attachments?.map((a: any) => a.url) || []).join(" ")}"`;
+                    const reactions = `"${(msg.reactions?.map((r: any) => `${r.emoji.name}:${r.count}`) || []).join(" ")}"`;
+                    const stickers = `"${(msg.sticker_items?.map((s: any) => s.name) || []).join(" ")}"`;
+                    const replyTo = `"${msg.referenced_message?.id || ""}"`;
+                    return [forumId, forumName, postId, postTitle, msgId, authorId, author, date, content, attachments, reactions, stickers, replyTo].join(",");
+                }).join("\n") + "\n";
+                await writer.write(csvRows);
+            } else if (options.format === "PlainText") {
+                const textRows = messages.map(msg => {
+                    const author = msg.author?.global_name || msg.author?.username || "Unknown";
+                    const date = new Date(msg.timestamp).toISOString().replace("T", " ").substring(0, 19);
+                    let text = `[${date}] ${author}: ${msg.content || ""}`;
+                    if (msg.attachments?.length) {
+                        text += `\n  [Attachments: ${msg.attachments.map((a: any) => a.url).join(", ")}]`;
+                    }
+                    return text;
+                }).join("\n") + "\n";
+                await writer.write(textRows);
+            }
+
+            totalMessagesExported += messages.length;
+        }
+
+        if (options.format === "HtmlDark" || options.format === "HtmlLight") {
+            await writer.write(renderHtmlFooter(totalMessagesExported));
+        } else if (options.format === "Json") {
+            await writer.write(`\n  ],\n  "totalMessages": ${totalMessagesExported}\n}\n`);
+        }
+        await writer.close();
+        return totalMessagesExported;
+    }
+
+    // Standard Channel / DM / Thread Exporting
+    if (options.format === "HtmlDark" || options.format === "HtmlLight") {
+        await writer.write(renderHtmlHeader(channelName, channel.id, isDark));
+    } else if (options.format === "Json") {
+        await writer.write(`{\n  "channel": ${JSON.stringify({ id: channel.id, name: channelName })},\n  "messages": [\n`);
+    } else if (options.format === "Csv") {
+        await writer.write("MessageID,AuthorID,Author,Date,Content,Attachments,Reactions,Stickers,ReplyTo\n");
+    } else if (options.format === "PlainText") {
+        await writer.write(`====================================================\nChannel: ${channelName} (${channel.id})\nExport Date: ${new Date().toLocaleString()}\n====================================================\n\n`);
+    }
 
     const beforeSnowflake = options.beforeDate ? dateToSnowflake(new Date(options.beforeDate)) : undefined;
     const afterSnowflake = options.afterDate ? dateToSnowflake(new Date(options.afterDate)) : undefined;
@@ -1131,11 +1549,13 @@ async function exportChannelStreaming(
 }
 
 function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalProps: RenderModalProps; }) {
+    const isForum = isForumChannel(channel);
     const [format, setFormat] = useState<ExportFormat>("HtmlDark");
     const [afterDate, setAfterDate] = useState<string>("");
     const [beforeDate, setBeforeDate] = useState<string>("");
     const [maxMessages, setMaxMessages] = useState<string>("");
     const [includeBots, setIncludeBots] = useState<boolean>(true);
+    const [includeArchived, setIncludeArchived] = useState<boolean>(true);
     const [hyperSpeed, setHyperSpeed] = useState<boolean>(true);
 
     const [isExporting, setIsExporting] = useState<boolean>(false);
@@ -1151,12 +1571,11 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
     const handleStartExport = async () => {
         const safeName = channelName.replace(/[^a-z0-9_-]/gi, "_").toLowerCase();
         const dateStr = new Date().toISOString().substring(0, 10);
-        const ext = format === "Json" ? "json" : format === "Csv" ? "csv" : format === "PlainText" ? "txt" : "html";
-        const filename = `${safeName}_${dateStr}.${ext}`;
+        const ext = format === "Json" ? "json" : format === "Csv" ? "csv" : format === "PlainText" ? "txt" : format === "HtmlZip" ? "zip" : "html";
+        const filename = `${safeName}_${isForum ? 'forum_' : ''}${dateStr}.${ext}`;
 
         let writer: StreamWriter;
         try {
-            // Prompt user for save destination BEFORE starting export
             writer = await createStreamWriter(filename, format);
         } catch (e: any) {
             if (e?.isCanceled) return;
@@ -1188,6 +1607,7 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                     beforeDate: beforeDate || undefined,
                     maxMessages: maxMessages ? parseInt(maxMessages, 10) : undefined,
                     includeBotMessages: includeBots,
+                    includeArchivedThreads: includeArchived,
                     respectRateLimits: !hyperSpeed,
                 },
                 writer,
@@ -1227,8 +1647,8 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
         <Modal
             {...modalProps}
             size="md"
-            title={`Export Chat - #${channelName}`}
-            subtitle="Configure export settings before downloading."
+            title={`Export ${isForum ? 'Forum' : 'Chat'} - #${channelName}`}
+            subtitle={isForum ? "Configure forum posts & thread export settings." : "Configure export settings before downloading."}
             actions={isExporting ? [
                 {
                     text: "Cancel Export",
@@ -1254,9 +1674,9 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
         >
             {isExporting ? (
                 <div className="vc-ce-progress-box">
-                    <HeadingSecondary>Exporting Messages...</HeadingSecondary>
+                    <HeadingSecondary>Exporting {isForum ? "Forum Posts..." : "Messages..."}</HeadingSecondary>
                     <div className="vc-ce-progress-count">
-                        {progress.count.toLocaleString()} messages ({progress.rate} msgs/sec)
+                        {progress.count.toLocaleString()} messages {progress.rate > 0 ? `(${progress.rate} msgs/sec)` : ""}
                     </div>
 
                     <div style={{
@@ -1296,11 +1716,23 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                             value={format}
                             onChange={e => setFormat(e.target.value as ExportFormat)}
                         >
-                            <option value="HtmlDark">HTML (Dark Theme - Discord Styled)</option>
-                            <option value="HtmlLight">HTML (Light Theme - Discord Styled)</option>
-                            <option value="Json">JSON (Full message & metadata)</option>
-                            <option value="Csv">CSV (Spreadsheet compatible)</option>
-                            <option value="PlainText">Plain Text (.txt)</option>
+                            {isForum ? (
+                                <>
+                                    <option value="HtmlDark">HTML (Single File - Master Catalog)</option>
+                                    <option value="HtmlZip">HTML (Multi-File ZIP Bundle)</option>
+                                    <option value="Json">JSON (Full Forum & Threads)</option>
+                                    <option value="Csv">CSV (Spreadsheet with Forum & Post Titles)</option>
+                                    <option value="PlainText">Plain Text (.txt)</option>
+                                </>
+                            ) : (
+                                <>
+                                    <option value="HtmlDark">HTML (Dark Theme - Discord Styled)</option>
+                                    <option value="HtmlLight">HTML (Light Theme - Discord Styled)</option>
+                                    <option value="Json">JSON (Full message & metadata)</option>
+                                    <option value="Csv">CSV (Spreadsheet compatible)</option>
+                                    <option value="PlainText">Plain Text (.txt)</option>
+                                </>
+                            )}
                         </select>
                     </div>
 
@@ -1329,7 +1761,7 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                     </div>
 
                     <div className="vc-ce-section">
-                        <div className="vc-ce-label">Message Limit (Optional)</div>
+                        <div className="vc-ce-label">{isForum ? "Message Limit Per Post (Optional)" : "Message Limit (Optional)"}</div>
                         <input
                             className="vc-ce-input"
                             type="number"
@@ -1347,6 +1779,15 @@ function ExportConfigModal({ channel, modalProps }: { channel: Channel; modalPro
                             onChange={setIncludeBots}
                             hideBorder
                         />
+                        {isForum && (
+                            <FormSwitch
+                                title="Include Archived Posts"
+                                description="Export both active and archived forum threads."
+                                value={includeArchived}
+                                onChange={setIncludeArchived}
+                                hideBorder
+                            />
+                        )}
                         <FormSwitch
                             title="Hyper-Speed Mode"
                             description="Ignore advisory rate limits (pause only on HTTP 429)."
@@ -1371,11 +1812,13 @@ const contextMenuPatch: NavContextMenuPatchCallback = (children, { channel, user
     const targetChannel = channel ?? (user ? ChannelStore.getDMFromUserId(user.id) : null);
     if (!targetChannel) return;
 
+    const isForum = isForumChannel(targetChannel);
+
     children.push(
         <Menu.MenuGroup key="vc-chat-exporter-group">
             <Menu.MenuItem
                 id="vc-chat-exporter"
-                label="Export Chat"
+                label={isForum ? "Export Forum" : "Export Chat"}
                 action={() => openExportModal(targetChannel)}
             />
         </Menu.MenuGroup>
@@ -1387,7 +1830,7 @@ let dockRoot: any = null;
 
 export default definePlugin({
     name: "ChatExporter",
-    description: "High-speed chat exporter based on DiscordChatExporter with date filtering, limits, and multi-format exports.",
+    description: "High-speed chat exporter based on DiscordChatExporter with forum exporting, date filtering, limits, and multi-format exports.",
     authors: [
         {
             name: "qssaf",

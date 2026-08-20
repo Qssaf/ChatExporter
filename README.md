@@ -2,21 +2,26 @@
 
 A high-performance Discord chat export plugin for **Vencord** and **Vesktop**, inspired by [DiscordChatExporter](https://github.com/Tyrrrz/DiscordChatExporter).
 
-Export complete message histories from **Direct Messages (DMs)**, **Group DMs**, and **Server Channels** directly from Discord's right-click context menu.
+Export complete message histories from **Direct Messages (DMs)**, **Group DMs**, **Server Channels**, and **Forum / Media Channels** directly from Discord's right-click context menu.
 
 ---
 
 ## Features
 
 * **Ultra-Fast Throughput:** Uses Discord API v10 with native HTTP/2 streaming, interleaved asynchronous pipelining, and 64-bit Discord Snowflake date indexing for maximum download speeds.
+* **Forum and Media Channel Exports:** Full support for Discord Forum channels and Media galleries. Exports active and archived posts with an interactive catalog index.
+* **Disk-Buffered Streaming:** Batches writes in 20,000-message blocks directly to disk via native File System Access streams, keeping RAM usage capped at ~15MB regardless of channel size.
 * **Multiple Export Formats:**
   * **HTML (Dark Theme):** Styled to look and feel like Discord with avatars, embeds, attachments, and timestamps.
   * **HTML (Light Theme):** Discord light mode styling.
+  * **HTML (Multi-File ZIP Bundle):** Packages an interactive catalog `index.html` with separate post pages inside a `.zip` archive.
   * **JSON:** Full structured message objects with all metadata.
   * **CSV:** Spreadsheet-compatible format with timestamps, authors, reactions, and attachments.
   * **Plain Text (.txt):** Clean, chronological text transcripts.
+* **Floating Export Manager Dock:** Real-time floating status card in the bottom-right corner showing active downloads, live speed, progress percentage, ETA, and a 1-click cancel button.
+* **Instant Cancellation:** Uses native `AbortController` to immediately terminate network sockets on cancel without saving corrupt files.
 * **Discord-Style Message Grouping:** Consecutive messages sent by the same user within 7 minutes are grouped together with a single avatar/header.
-* **Rich Message Elements:** Renders markdown (bold, italics, code blocks), replied-to message previews, reactions with count badges, custom emojis, stickers, and image previews.
+* **Rich Message Elements:** Renders markdown, replied-to message previews, reactions with count badges, custom emojis, stickers, and playable media.
 * **Advanced Filtering:** Filter by date range (**After** / **Before**) and set custom message limits.
 * **Hyper-Speed Mode:** Aggressive mode that bypasses sliding advisory rate-limit pauses, operating at maximum connection bandwidth and pausing only on HTTP 429 responses.
 * **Client-Native:** Runs directly in your client without needing third-party token scrapers or external binaries.
